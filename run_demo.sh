@@ -4,11 +4,6 @@
 # 这里列出了一些常见的 conda 安装路径，脚本会依次尝试
 CONDA_PATHS=(
     "/home/conda/etc/profile.d/conda.sh"
-    "$HOME/anaconda3/etc/profile.d/conda.sh"
-    "$HOME/miniconda3/etc/profile.d/conda.sh"
-    "/opt/conda/etc/profile.d/conda.sh"
-    "/usr/local/anaconda3/etc/profile.d/conda.sh"
-    "/usr/local/miniconda3/etc/profile.d/conda.sh"
 )
 
 CONDA_INITIALIZED=false
