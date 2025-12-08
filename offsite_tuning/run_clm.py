@@ -89,11 +89,11 @@ logger = get_logger(__name__)
 
 
 def main():
+    # 解析命令行参数
     args = parse_args()
 
-    # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
-    # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
-    # in the environment
+    # 初始化 accelerator。Accelerator 负责处理设备放置（如 GPU/TPU 分配）和分布式训练。
+    # 如果使用跟踪（tracking），也在这里初始化。
     accelerator_log_kwargs = {}
 
     accelerator_log_kwargs["log_with"] = args.report_to
@@ -102,14 +102,14 @@ def main():
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps, **accelerator_log_kwargs)
 
-    # Handle the repository creation
+    # 处理输出目录的创建
     if accelerator.is_main_process:
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
     accelerator.wait_for_everyone()
 
-    # Make one log on every process with the configuration for debugging.
-    # also log to a file in output_dir
+    # 配置日志记录
+    # 在每个进程上都进行日志记录，同时在主进程上将日志写入文件
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
@@ -120,6 +120,8 @@ def main():
         ] if accelerator.is_main_process else []
     )
     logger.info(accelerator.state, main_process_only=False)
+    
+    # 设置 datasets 和 transformers 库的日志级别
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
         transformers.utils.logging.set_verbosity_info()
@@ -127,14 +129,12 @@ def main():
         datasets.utils.logging.set_verbosity_error()
         transformers.utils.logging.set_verbosity_error()
 
-    # If passed along, set the training seed now.
+    # 设置随机种子，确保可复现性
     if args.seed is not None:
         set_seed(args.seed)
 
-    # Load pretrained model and tokenizer
-    #
-    # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
-    # download model & vocab.
+    # 加载预训练模型和分词器 (Tokenizer)
+    # 在分布式训练中，.from_pretrained 方法保证只有一个本地进程下载模型和词表
     if args.config_name:
         config = AutoConfig.from_pretrained(args.config_name)
     elif args.model_name_or_path:
@@ -167,18 +167,19 @@ def main():
         logger.info("Training new model from scratch")
         model = AutoModelForCausalLM.from_config(config)
 
-    # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
-    # on a small vocab and want a smaller embedding size, remove this test.
+    # 调整 token embeddings 的大小，以防词表大小发生变化
     embedding_size = model.get_input_embeddings().weight.shape[0]
     if len(tokenizer) > embedding_size:
         model.resize_token_embeddings(len(tokenizer))
 
-    if args.dataset_name in task_dict:  # special case for e2e_nlg dataset
+    # 加载和处理数据集
+    if args.dataset_name in task_dict:  # 针对 e2e_nlg 数据集的特殊处理
         raw_datasets = get_raw_datasets(args)
         lm_datasets = process_text2text_datasets(
             raw_datasets, args, tokenizer, accelerator)
     else:
         if args.train_tokenized_dataset and args.val_tokenized_dataset:
+            # 如果提供了已分词的数据集路径，直接加载
             tokenized_datasets = load_from_disk(args.train_tokenized_dataset)
             val_dataset = load_from_disk(args.val_tokenized_dataset)
             if 'validation' in val_dataset:
@@ -186,31 +187,33 @@ def main():
             else:
                 tokenized_datasets["validation"] = val_dataset['train']
         else:
+            # 否则加载原始数据集并进行分词
             raw_datasets = get_raw_datasets(args)
 
             tokenized_datasets = get_tokenized_datasets(
                 raw_datasets, args, accelerator, tokenizer)
 
+        # 获取最终的语言模型数据集
         lm_datasets = get_lm_datasets(
             tokenized_datasets, args, accelerator, tokenizer)
 
     train_dataset = lm_datasets["train"]
     eval_dataset = lm_datasets["validation"]
 
+    # 如果指定了样本数量，进行截断
     if args.train_num_samples is not None:
-        # check if we have enough samples for the training set
         if args.train_num_samples > len(train_dataset):
             args.train_num_samples = len(train_dataset)
         train_dataset = train_dataset.select(
             range(args.train_num_samples))
 
     if args.validation_num_samples is not None:
-        # check if we have enough samples for the validation set
         if args.validation_num_samples > len(eval_dataset):
             args.validation_num_samples = len(eval_dataset)
         eval_dataset = eval_dataset.select(
             range(args.validation_num_samples))
 
+    # 创建 DataLoader
     collator = default_data_collator
     train_dataloader = DataLoader(
         train_dataset, shuffle=True, collate_fn=collator, batch_size=args.per_device_train_batch_size
@@ -219,28 +222,36 @@ def main():
         eval_dataset, collate_fn=collator, batch_size=args.per_device_eval_batch_size
     )
 
+    # 关键步骤：设置 Teacher 和 Student 模型
+    # 这通常涉及创建模拟器 (emulator) 或准备适配器 (adapter) 结构
     model = setup_teacher_student(model, args, accelerator)
 
+    # 如果不使用 Teacher（纯 Student 训练），清理 Teacher 相关资源
     if args.no_teacher:
         model.teacher = None
         to_student(model, args)
         gc.collect()
         torch.cuda.empty_cache()
 
+    # 如果只训练 Adapter 或特定模块，确保 LM head 的梯度开启（如果需要训练 LM head）
     if args.train_module in ['adapter', 'all'] and args.train_lm_head:
         for param in model.lm_head.parameters():
             param.requires_grad = True
             param.data = param.data.float()
 
+    # 应用 LoRA (Low-Rank Adaptation)
     if args.use_lora:
         use_lora(model.trainable_module, args.lora_rank, args.lora_alpha)
 
+    # 应用 Adapter
     if args.use_adapter:
         use_adapter(model.trainable_module, args.adapter_size)
 
+    # 应用 BitFit (Bias-term Fine-tuning)
     if args.use_bitfit:
         use_bitfit(model.trainable_module)
 
+    # 如果是从之前的 Student 检查点恢复
     if args.load_student and not args.restart_training:
         base_results = json.load(
             open(os.path.join(args.load_student, 'all_results.json'), 'r'))
@@ -251,6 +262,7 @@ def main():
         starting_epoch = 0
         resume_step = -1
 
+    # 计算可训练参数的数量
     trainable_params = sum(p.numel()
                            for p in model.parameters() if p.requires_grad)
 
@@ -261,8 +273,8 @@ def main():
             logger.info(
                 f"Trainable parameter: {name} with shape {param.shape} and dtype {param.dtype}")
 
-    # Optimizer
-    # Split weights in two groups, one with weight decay and the other not.
+    # 优化器设置
+    # 将权重分为两组：一组应用权重衰减（weight decay），另一组不应用（如 bias 和 layer_norm）
     no_decay = ["bias", "layer_norm.weight"]
     optimizer_grouped_parameters = [
         {
@@ -277,7 +289,7 @@ def main():
     optimizer = torch.optim.AdamW(
         optimizer_grouped_parameters, lr=args.learning_rate)
 
-    # Scheduler and math around the number of training steps.
+    # 学习率调度器 (Scheduler) 设置
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(
         len(train_dataloader) / args.gradient_accumulation_steps)
@@ -292,28 +304,27 @@ def main():
         num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
     )
 
-    # Prepare everything with our `accelerator`.
+    # 使用 accelerator 准备模型、优化器、数据加载器和调度器
     model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
     )
 
-    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
+    # 重新计算总训练步数（因为 DataLoader 大小可能因分布式设置而改变）
     num_update_steps_per_epoch = math.ceil(
         len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    # Afterwards we recalculate our number of training epochs
+    # 重新计算训练 Epoch 数
     args.num_train_epochs = math.ceil(
         args.max_train_steps / num_update_steps_per_epoch)
 
-    # We need to initialize the trackers we use, and also store our configuration.
-    # The trackers initializes automatically on the main process.
+    # 初始化 trackers（如 TensorBoard, WandB）
     experiment_config = vars(args)
-    # TensorBoard cannot log Enums, need the raw value
+    # TensorBoard 无法记录 Enum，需要转为原始值
     experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
     accelerator.init_trackers("offsite_tuning", experiment_config)
 
-    # Train!
+    # 开始训练！
     total_batch_size = args.per_device_train_batch_size * \
         accelerator.num_processes * args.gradient_accumulation_steps
 
@@ -328,6 +339,7 @@ def main():
         f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
 
+    # 定义评估函数
     def eval_epoch():
         model.eval()
         losses = []
@@ -338,7 +350,7 @@ def main():
             losses.append(accelerator.gather_for_metrics(
                 loss.repeat(args.per_device_eval_batch_size)).cpu())
         losses = torch.cat(losses).flatten()
-        # filter out nan
+        # 过滤掉 nan
         losses = losses[~torch.isnan(losses)]
         try:
             eval_loss = torch.mean(losses)
@@ -348,6 +360,7 @@ def main():
 
         return eval_loss, perplexity
 
+    # 初始评估：Teacher 模型的 Zero-shot 性能
     if not args.no_teacher:
         to_teacher(model.module, args)
         _, teacher_zero_shot_perplexity = eval_epoch()
@@ -356,6 +369,7 @@ def main():
     else:
         teacher_zero_shot_perplexity = 0
 
+    # 初始评估：Student 模型的 Zero-shot 性能
     to_student(model.module, args)
 
     # for name, param in model.named_parameters():
@@ -367,16 +381,17 @@ def main():
         f"Student zero shot perplexity: {student_zero_shot_perplexity}")
     best_perplexity = float("inf")
 
-    # Only show the progress bar once on each machine.
+    # 进度条
     progress_bar = tqdm(range(args.max_train_steps),
                         disable=not accelerator.is_local_main_process)
 
     completed_steps = 0
 
-    # update the progress_bar if load from checkpoint
+    # 如果是从检查点恢复，更新进度条
     progress_bar.update(starting_epoch * num_update_steps_per_epoch)
     completed_steps = starting_epoch * num_update_steps_per_epoch
 
+    # 训练循环
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
         total_lm_loss, total_kd_loss = 0, 0
@@ -384,7 +399,7 @@ def main():
         best_lm_loss, best_kd_loss = float("inf"), float("inf")
         skipped_steps = 0
         for step, batch in enumerate(train_dataloader):
-            # We need to skip steps until we reach the resumed step
+            # 如果是恢复训练，跳过已完成的步数
             if args.load_student and epoch == starting_epoch and step <= resume_step:
                 progress_bar.update(1)
                 progress_bar.set_description(
@@ -396,11 +411,14 @@ def main():
             with accelerator.accumulate(model):
                 outputs = model(**batch)
                 lm_loss = outputs.loss
+                
+                # 计算知识蒸馏 (KD) 损失
                 if not args.no_teacher:
                     kd_loss = get_kd_loss(model.module)
                 else:
                     kd_loss = 0
 
+                # 总损失 = LM 损失 + KD 损失
                 loss = args.lm_weight * lm_loss + args.kd_weight * \
                     kd_loss if args.kd_weight != 0 else lm_loss
                 progress_bar.set_description(
@@ -424,19 +442,23 @@ def main():
                 optimizer.zero_grad()
             # end accumulate gradients
 
-            # Checks if the accelerator has performed an optimization step behind the scenes
+            # 检查 accelerator 是否执行了优化步
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 completed_steps += 1
             else:
                 continue
 
+            # 定期评估
             if completed_steps % args.eval_steps == 0:
+                # 评估 Plug-in 效果 (Teacher + Adapter)
                 if not args.no_teacher:
                     to_teacher(model.module, args)
                     plug_eval_loss, plug_ppl = eval_epoch()
                 else:
                     plug_eval_loss, plug_ppl = 0, 0
+                
+                # 评估 Student 效果
                 to_student(model.module, args)
                 eval_loss, perplexity = eval_epoch()
 
@@ -465,6 +487,7 @@ def main():
                 is_best = perplexity < best_perplexity
                 best_perplexity = min(best_perplexity, perplexity)
 
+                # 保存最佳模型
                 if not args.no_save_model and is_best and accelerator.is_main_process:
                     unwrapped_model = accelerator.unwrap_model(model)
                     if args.save_module in ["student", "all"]:
