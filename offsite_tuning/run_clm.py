@@ -402,6 +402,7 @@ def main():
         best_lm_loss, best_kd_loss = float("inf"), float("inf")
         skipped_steps = 0
         for step, batch in enumerate(train_dataloader):
+            logger.info(f"DEBUG: Processing step {step}")
             # 如果是恢复训练，跳过已完成的步数
             if args.load_student and epoch == starting_epoch and step <= resume_step:
                 progress_bar.update(1)
@@ -412,6 +413,7 @@ def main():
                 continue
 
             with accelerator.accumulate(model):
+                logger.info(f"DEBUG: Entering accumulate for step {step}")
                 outputs = model(**batch)
                 lm_loss = outputs.loss
                 
