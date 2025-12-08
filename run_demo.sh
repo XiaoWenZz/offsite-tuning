@@ -51,7 +51,7 @@ accelerate launch \
     --model_name_or_path facebook/opt-1.3b \
     --dataset_name wikitext \
     --dataset_config_name wikitext-2-raw-v1 \
-    --per_device_train_batch_size 8 \
+    --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 8 \
     --learning_rate 2e-5 \
     --num_train_epochs 1 \

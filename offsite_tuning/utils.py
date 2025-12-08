@@ -627,7 +627,7 @@ def setup_teacher_student(model, args, accelerator):
 
     if args.train_module == 'student':
         for param in student.parameters():
-            param.data = param.data.float()
+            # param.data = param.data.float()
             param.requires_grad = True
     elif args.train_module == 'adapter':
         for param in student.parameters():
