@@ -362,7 +362,7 @@ def main():
 
     # 初始评估：Teacher 模型的 Zero-shot 性能
     if not args.no_teacher:
-        to_teacher(model.module, args)
+        to_teacher(accelerator.unwrap_model(model), args)
         _, teacher_zero_shot_perplexity = eval_epoch()
         logger.info(
             f"Teacher zero shot perplexity: {teacher_zero_shot_perplexity}")
@@ -370,7 +370,7 @@ def main():
         teacher_zero_shot_perplexity = 0
 
     # 初始评估：Student 模型的 Zero-shot 性能
-    to_student(model.module, args)
+    to_student(accelerator.unwrap_model(model), args)
 
     # for name, param in model.named_parameters():
     #     logger.info(
@@ -414,7 +414,7 @@ def main():
                 
                 # 计算知识蒸馏 (KD) 损失
                 if not args.no_teacher:
-                    kd_loss = get_kd_loss(model.module)
+                    kd_loss = get_kd_loss(accelerator.unwrap_model(model))
                 else:
                     kd_loss = 0
 
@@ -453,13 +453,13 @@ def main():
             if completed_steps % args.eval_steps == 0:
                 # 评估 Plug-in 效果 (Teacher + Adapter)
                 if not args.no_teacher:
-                    to_teacher(model.module, args)
+                    to_teacher(accelerator.unwrap_model(model), args)
                     plug_eval_loss, plug_ppl = eval_epoch()
                 else:
                     plug_eval_loss, plug_ppl = 0, 0
                 
                 # 评估 Student 效果
-                to_student(model.module, args)
+                to_student(accelerator.unwrap_model(model), args)
                 eval_loss, perplexity = eval_epoch()
 
                 lm_loss = interval_lm_loss / args.eval_steps
