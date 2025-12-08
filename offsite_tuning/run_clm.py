@@ -161,7 +161,10 @@ def main():
             args.model_name_or_path,
             from_tf=bool(".ckpt" in args.model_name_or_path),
             config=config,
-            torch_dtype=torch.float16
+            # === 【修改开始】 ===
+            # 不要在这里强制 float16，否则混合精度训练会找不到 FP32 主权重而报错
+            torch_dtype=torch.float32 
+            # === 【修改结束】 ===
         )
     else:
         logger.info("Training new model from scratch")
@@ -225,6 +228,14 @@ def main():
     # 关键步骤：设置 Teacher 和 Student 模型
     # 这通常涉及创建模拟器 (emulator) 或准备适配器 (adapter) 结构
     model = setup_teacher_student(model, args, accelerator)
+
+    # === 【新增代码开始】 ===
+    # 确保 Teacher 模型的所有参数与 Student 保持一致的精度 (FP16)
+    if not args.no_teacher and hasattr(model, "teacher"):
+        # 将 teacher 移动到正确的 dtype (通常是 float16)
+        model.teacher.to(dtype=torch.float16)
+        logger.info(f"Explicitly cast teacher model to torch.float16 for memory saving")
+    # === 【新增代码结束】 ===
 
     # 如果不使用 Teacher（纯 Student 训练），清理 Teacher 相关资源
     if args.no_teacher:
@@ -308,6 +319,14 @@ def main():
     model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
     )
+
+    # === 【新增代码：强制开启梯度检查点】 ===
+    # 这能大幅降低显存峰值，确保长时间训练不崩溃
+    model.gradient_checkpointing_enable()
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+    logger.info("Gradient Checkpointing enabled explicitly.")
+    # ==========================================
 
     # 重新计算总训练步数（因为 DataLoader 大小可能因分布式设置而改变）
     num_update_steps_per_epoch = math.ceil(
@@ -419,7 +438,12 @@ def main():
                 
                 # 计算知识蒸馏 (KD) 损失
                 if not args.no_teacher:
-                    kd_loss = get_kd_loss(accelerator.unwrap_model(model))
+                    # === 【修改开始】 ===
+                    # 因为 unwrap_model 会脱离 accelerate 的自动精度环境
+                    # 必须手动添加 autocast，否则部分计算会回退到 FP32 导致报错
+                    with accelerator.autocast():
+                        kd_loss = get_kd_loss(accelerator.unwrap_model(model))
+                    # === 【修改结束】 ===
                 else:
                     kd_loss = 0
 

@@ -1,0 +1,1 @@
+{"best_perplexity": 12.920469758030777, "plug_perplexity": 31.496668932601725, "teacher_zero_shot_perplexity": 31.496668932601725, "student_zero_shot_perplexity": 31.496668932601725, "train_lm_loss": 2.5033223927021027, "train_kd_loss": 0.21402422837913038, "epoch": 0, "step": 4600, "trainable_params": 1208598528}

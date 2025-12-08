@@ -46,7 +46,7 @@ echo "Starting training..."
 # 运行全参数微调
 accelerate launch \
     --num_processes=1 \
-    --mixed_precision=bf16 \
+    --mixed_precision=fp16 \
     offsite_tuning/run_clm.py \
     --model_name_or_path facebook/opt-1.3b \
     --dataset_name wikitext \
