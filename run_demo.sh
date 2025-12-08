@@ -39,6 +39,7 @@ cd "$SCRIPT_DIR"
 
 # 设置单卡可见
 export CUDA_VISIBLE_DEVICES=0
+export HF_ENDPOINT=https://hf-mirror.com
 
 echo "Starting training..."
 
