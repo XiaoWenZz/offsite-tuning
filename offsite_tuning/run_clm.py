@@ -392,8 +392,11 @@ def main():
     completed_steps = starting_epoch * num_update_steps_per_epoch
 
     # 训练循环
+    logger.info(f"DEBUG: Starting epoch {starting_epoch} of {args.num_train_epochs}")
+    logger.info(f"DEBUG: Train dataloader length: {len(train_dataloader)}")
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
+        logger.info(f"DEBUG: Entering loop for epoch {epoch}")
         total_lm_loss, total_kd_loss = 0, 0
         interval_lm_loss, interval_kd_loss = 0, 0
         best_lm_loss, best_kd_loss = float("inf"), float("inf")
