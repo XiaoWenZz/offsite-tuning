@@ -634,10 +634,10 @@ def setup_teacher_student(model, args, accelerator):
             param.requires_grad = False
         if not args.freeze_bottom:
             for param in layers[:l].parameters():
-                param.data = param.data.float()
+                # param.data = param.data.float()
                 param.requires_grad = True
         for param in layers[r:].parameters():
-            param.data = param.data.float()
+            # param.data = param.data.float()
             param.requires_grad = True
     elif args.train_module == 'all':
         for param in student.parameters():
