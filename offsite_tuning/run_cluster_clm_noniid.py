@@ -98,6 +98,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run Clustered Federated Offsite-Tuning")
     parser.add_argument("--model_name", type=str, default="facebook/opt-125m")
     parser.add_argument("--dataset_name", type=str, default="ag_news")
+    parser.add_argument("--text_column", type=str, default="text")
+    parser.add_argument("--label_column", type=str, default="label")
     parser.add_argument("--num_clients", type=int, default=4)
     parser.add_argument("--num_clusters", type=int, default=2)
     parser.add_argument("--alpha", type=float, default=0.1)
@@ -135,7 +137,30 @@ def main():
     optimizer = accelerator.prepare(optimizer)
 
     # Prepare Data
-    dataset = datasets.load_dataset(args.dataset_name, split="train[:2000]") # 增加一点数据量
+    dataset = datasets.load_dataset(args.dataset_name)
+
+    # === [Modification] 基于参数的列名标准化 (No Hard-coding) ===
+    
+    logger.info(f"Target columns from args: Text='{args.text_column}', Label='{args.label_column}'")
+    
+    # 1. 检查列名是否存在
+    if args.text_column not in dataset.column_names:
+        raise ValueError(f"Column '{args.text_column}' not found in dataset. Available columns: {dataset.column_names}")
+    
+    # 部分数据集可能没有 label 列（如果是纯无监督训练），这里做一个容错，或者强制要求
+    if args.label_column not in dataset.column_names:
+         raise ValueError(f"Column '{args.label_column}' not found in dataset. Available columns: {dataset.column_names}")
+
+    # 2. 统一重命名为内部通用的 'text' 和 'label'
+    # 这样后续的 tokenizer 和 partition 逻辑都不用改
+    if args.text_column != "text":
+        dataset = dataset.rename_column(args.text_column, "text")
+        logger.info(f"Renamed column '{args.text_column}' -> 'text'")
+    
+    if args.label_column != "label":
+        dataset = dataset.rename_column(args.label_column, "label")
+        logger.info(f"Renamed column '{args.label_column}' -> 'label'")
+
     client_indices = partition_data_dirichlet(dataset, args.num_clients, alpha=args.alpha)
     
     clients = []

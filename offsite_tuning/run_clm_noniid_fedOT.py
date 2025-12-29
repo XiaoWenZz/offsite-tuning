@@ -136,7 +136,7 @@ def main():
     model = accelerator.prepare(emulator)
 
     # 2. 准备数据与客户端
-    dataset = datasets.load_dataset(args.dataset_name, split="train[:2000]")
+    dataset = datasets.load_dataset(args.dataset_name)
     client_indices = partition_data_dirichlet(dataset, args.num_clients, alpha=args.alpha)
     
     clients = []

@@ -126,8 +126,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
     full_model = AutoModelForCausalLM.from_pretrained(args.model_name, config=config)
     
-    # 评估基准数据 (Target Label = 1, Sports)
-    dataset = datasets.load_dataset(args.dataset_name, split="train[:1000]")
+    dataset = datasets.load_dataset(args.dataset_name)
     client_dataset = dataset.filter(lambda x: x['label'] == 1) 
     
     def tokenize_fn(examples):
