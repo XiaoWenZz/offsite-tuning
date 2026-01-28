@@ -4,7 +4,6 @@ import sys
 import copy
 import random
 import numpy as np
-import gc
 from sklearn.cluster import KMeans
 import torch
 import torch.nn as nn
@@ -21,11 +20,12 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 import wandb
 import os
+from peft import get_peft_model, LoraConfig, TaskType, PeftModel
 
 logger = get_logger(__name__)
 
 # ==========================================
-# [组件] Harmonizer (ScaleOT)
+# [组件] Harmonizer (Zero Init / Identity Start)
 # ==========================================
 class Harmonizer(nn.Module):
     def __init__(self, config, rank=128, target_attention_type="full"):
@@ -36,7 +36,7 @@ class Harmonizer(nn.Module):
         self.activation = nn.ReLU()
         self.up_proj = nn.Linear(self.rank, self.input_dim)
         
-        # [FIX] Zero Initialization for Identity Start
+        # [Critical] Zero Init: Start as Identity Function (f(x) = x + 0)
         nn.init.zeros_(self.down_proj.weight)
         nn.init.zeros_(self.up_proj.weight)
         nn.init.zeros_(self.up_proj.bias)
@@ -55,18 +55,23 @@ class Harmonizer(nn.Module):
         x = self.down_proj(x)
         x = self.activation(x)
         x = self.up_proj(x)
-        output = x + residual  # Initial state: output = x + 0 = x
-        return output
+        return x + residual # Return Raw Tensor
 
+# ==========================================
+# [组件] SRC Layer (Frozen + SVD)
+# ==========================================
 class SRCLayer(nn.Module):
     def __init__(self, original_layer, idx, rank_ratio=0.6):
         super().__init__()
         self.layer = copy.deepcopy(original_layer)
         self.original_layer_idx = idx 
-        # [FIX] Copy attributes
+        # Copy attributes to fool Qwen2 model loop
         self.attention_type = getattr(original_layer, "attention_type", "full")
+        
+        # Freeze params
         for param in self.layer.parameters():
             param.requires_grad = False
+            
         self._compress_attention(rank_ratio)
 
     def _compress_attention(self, rank_ratio):
@@ -90,14 +95,19 @@ class SRCLayer(nn.Module):
         return self.layer(*args, **kwargs)
 
 # ==========================================
-# 工具函数
+# 工具函数 (Robust for PEFT & Qwen2)
 # ==========================================
 def get_module_layers(model):
-    if hasattr(model, "model"):
-        if hasattr(model.model, "layers"): return model.model.layers
-        elif hasattr(model.model, "decoder"): return model.model.decoder.layers
-    if hasattr(model, "decoder"): return model.decoder.layers
-    raise ValueError(f"Unknown model architecture: {type(model)}")
+    """
+    Robust layer retrieval handles: PeftModel -> base_model -> model -> layers
+    """
+    obj = model
+    if hasattr(obj, "base_model"): obj = obj.base_model
+    if hasattr(obj, "model"): obj = obj.model
+    if hasattr(obj, "model") and hasattr(obj.model, "layers"): return obj.model.layers
+    if hasattr(obj, "layers"): return obj.layers
+    if hasattr(obj, "decoder") and hasattr(obj.decoder, "layers"): return obj.decoder.layers
+    raise ValueError(f"Could not find layers in {type(model)}")
 
 def set_module_layers(model, new_layers):
     if hasattr(model, "model"):
@@ -115,65 +125,6 @@ def set_module_layers(model, new_layers):
         return
     raise ValueError(f"Unknown model architecture: {type(model)}")
 
-def create_custom_emulator(full_model, sensitivity_vector, budget_adapter=4, budget_src=4):
-    emulator = copy.deepcopy(full_model)
-    layers = get_module_layers(emulator)
-    total_layers = len(layers)
-    if isinstance(sensitivity_vector, list): sensitivity_vector = np.array(sensitivity_vector)
-    ranked_layers = sorted(enumerate(sensitivity_vector), key=lambda x: x[1], reverse=True)
-    mandatory_indices = {0, total_layers - 1}
-    adapter_indices = set(mandatory_indices)
-    for idx, score in ranked_layers:
-        if len(adapter_indices) >= budget_adapter: break
-        adapter_indices.add(idx)
-    src_indices = set()
-    for idx, score in ranked_layers:
-        if idx not in adapter_indices:
-            if len(src_indices) < budget_src: src_indices.add(idx)
-    
-    new_layers_list = []
-    current_layer_idx = 0
-    ref_type = getattr(layers[0], "attention_type", "full")
-
-    while current_layer_idx < total_layers:
-        if current_layer_idx in adapter_indices:
-            layer = layers[current_layer_idx]
-            layer.original_layer_idx = current_layer_idx
-            for param in layer.parameters(): param.requires_grad = True
-            new_layers_list.append(layer)
-            current_layer_idx += 1
-        elif current_layer_idx in src_indices:
-            src_layer = SRCLayer(layers[current_layer_idx], current_layer_idx, rank_ratio=0.6)
-            new_layers_list.append(src_layer)
-            current_layer_idx += 1
-        else:
-            gap_size = 0
-            while (current_layer_idx + gap_size < total_layers) and \
-                  (current_layer_idx + gap_size not in adapter_indices) and \
-                  (current_layer_idx + gap_size not in src_indices):
-                gap_size += 1
-            harmonizer = Harmonizer(full_model.config, rank=128, target_attention_type=ref_type)
-            new_layers_list.append(harmonizer)
-            current_layer_idx += gap_size
-            
-    set_module_layers(emulator, nn.ModuleList(new_layers_list))
-    emulator.config.use_cache = False
-    
-    # Freeze Anchors (Embedding/Head)
-    for name, param in emulator.named_parameters():
-        if "embed_tokens" in name or "lm_head" in name:
-            param.requires_grad = False
-            
-    return emulator
-
-def get_trainable_keys(model):
-    """[FIX] 获取所有需要更新的参数名称"""
-    keys = []
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            keys.append(name)
-    return set(keys)
-
 def compute_layer_sensitivity(model, accelerator):
     layers = get_module_layers(model)
     num_layers = len(layers)
@@ -181,53 +132,185 @@ def compute_layer_sensitivity(model, accelerator):
     for i, layer in enumerate(layers):
         grad_sum = 0.0
         for param in layer.parameters():
-            if param.grad is not None: grad_sum += param.grad.detach().float().norm(2).item()
+            if param.grad is not None:
+                grad_sum += param.grad.detach().float().norm(2).item()
         sensitivity_vector[i] = grad_sum
     norm = np.linalg.norm(sensitivity_vector)
     if norm > 0: sensitivity_vector = sensitivity_vector / norm
     return sensitivity_vector
 
-def evaluate_full_model_plugback(full_model, emulator_model, dataloader, accelerator, tokenizer):
-    full_layers = get_module_layers(full_model)
-    emulator_layers = get_module_layers(emulator_model)
-    original_weights = {}
-    
-    with torch.no_grad():
-        for emu_layer in emulator_layers:
-            if hasattr(emu_layer, "original_layer_idx") and emu_layer.original_layer_idx is not None:
-                real_idx = emu_layer.original_layer_idx
-                has_grad = any(p.requires_grad for p in emu_layer.parameters())
-                if not has_grad: continue
-                target_layer = full_layers[real_idx]
-                original_weights[real_idx] = {k: v.clone().cpu() for k, v in target_layer.state_dict().items()}
-                target_layer.load_state_dict(emu_layer.state_dict())
+def get_trainable_keys(model):
+    """Retrieve keys of parameters that require gradients."""
+    keys = []
+    for name, param in model.named_parameters():
+        if param.requires_grad: keys.append(name)
+    return set(keys)
 
-    full_model.to(accelerator.device); full_model.eval()
-    total_loss = 0; steps = 0; MAX_EVAL = 10
+def create_custom_emulator(full_model, sensitivity_vector, budget_adapter=4, budget_src=4):
+    """
+    FedRole Emulator Construction + LoRA Wrapping + Config Mapping
+    """
+    emulator = copy.deepcopy(full_model)
+    layers = get_module_layers(emulator)
+    total_layers = len(layers)
+    
+    if isinstance(sensitivity_vector, list): sensitivity_vector = np.array(sensitivity_vector)
+    ranked = sorted(enumerate(sensitivity_vector), key=lambda x: x[1], reverse=True)
+    
+    adapter_indices = set({0, total_layers-1})
+    for idx, _ in ranked:
+        if len(adapter_indices) >= budget_adapter: break
+        adapter_indices.add(idx)
+    
+    src_indices = set()
+    for idx, _ in ranked:
+        if idx not in adapter_indices:
+            if len(src_indices) < budget_src: src_indices.add(idx)
+            
+    new_layers = []
+    curr = 0
+    ref_type = getattr(layers[0], "attention_type", "full")
+    
+    # Layer Construction Loop
+    while curr < total_layers:
+        if curr in adapter_indices:
+            l = layers[curr]
+            l.original_layer_idx = curr
+            new_layers.append(l)
+            curr += 1
+        elif curr in src_indices:
+            new_layers.append(SRCLayer(layers[curr], curr, 0.6))
+            curr += 1
+        else:
+            gap = 0
+            while (curr + gap < total_layers) and (curr+gap not in adapter_indices) and (curr+gap not in src_indices): gap+=1
+            new_layers.append(Harmonizer(full_model.config, 128, ref_type))
+            curr += gap
+            
+    set_module_layers(emulator, nn.ModuleList(new_layers))
+    emulator.config.use_cache = False
+    
+    # [CRITICAL] Persist Layer Mapping in Config
+    layer_map = {}
+    for i, layer in enumerate(new_layers):
+        if hasattr(layer, "original_layer_idx") and layer.original_layer_idx is not None:
+            layer_map[i] = layer.original_layer_idx
+    emulator.config.layer_map = layer_map 
+    
+    # --- Apply LoRA ---
+    for param in emulator.parameters(): param.requires_grad = False
+    
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM, 
+        inference_mode=False, 
+        r=8, lora_alpha=32, lora_dropout=0.1,
+        target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    )
+    emulator = get_peft_model(emulator, peft_config)
+    
+    # Ensure config map is accessible on wrapper
+    if hasattr(emulator, "config"): emulator.config.layer_map = layer_map
+    
+    # Set Gradients: Train Harmonizer + LoRA
+    for name, param in emulator.named_parameters():
+        if "Harmonizer" in name or "lora_" in name: 
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+            
+    return emulator
+
+def evaluate_full_model_plugback(full_model, emulator_model, dataloader, accelerator, tokenizer):
+    """
+    Safe LoRA-aware Plug-back Evaluation.
+    Uses a COPY of full_model to prevent contaminating the base model with adapters.
+    """
+    # 1. 提取 Emulator 的 LoRA 权重 & 建立映射
+    emu_state = emulator_model.state_dict()
+    adapter_lora_state = {}
+    
+    # 获取层号映射表
+    idx_map = {}
+    # Check wrapper config first
+    if hasattr(emulator_model, "config") and hasattr(emulator_model.config, "layer_map"):
+        idx_map = emulator_model.config.layer_map
+    elif hasattr(emulator_model, "base_model") and hasattr(emulator_model.base_model.model, "config"):
+        if hasattr(emulator_model.base_model.model.config, "layer_map"):
+            idx_map = emulator_model.base_model.model.config.layer_map
+            
+    # 重映射 LoRA Key
+    mapped_count = 0
+    for k, v in emu_state.items():
+        if "lora_" in k:
+            parts = k.split('.')
+            try:
+                if 'layers' in parts:
+                    layer_kw_idx = parts.index('layers')
+                    emu_layer_idx = int(parts[layer_kw_idx + 1])
+                    
+                    if emu_layer_idx in idx_map:
+                        real_idx = idx_map[emu_layer_idx]
+                        parts[layer_kw_idx + 1] = str(real_idx)
+                        new_key = ".".join(parts)
+                        adapter_lora_state[new_key] = v.cpu() # 确保在 CPU
+                        mapped_count += 1
+            except: continue
+
+    # [Debug Print]
+    if not hasattr(evaluate_full_model_plugback, "debug_printed"):
+        print(f"🔥 Plug-back: Mapped {mapped_count} keys to Full Model.")
+        evaluate_full_model_plugback.debug_printed = True
+
+    # 2. [CRITICAL FIX] 创建 Full Model 的临时副本
+    # 我们不能直接修改 full_model，因为 get_peft_model 是 In-place 操作
+    # Qwen-1.5B 复制一份约为 3GB 内存，这比污染基座模型要安全得多
+    temp_full_model = copy.deepcopy(full_model)
+    
+    # 3. 挂载 LoRA 到副本上
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM, 
+        r=8, 
+        lora_alpha=32, 
+        target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    )
+    
+    # Wrap copy
+    peft_full_model = get_peft_model(temp_full_model, peft_config)
+        
+    # 加载重映射后的权重 (Strict=False 是必须的，因为我们只有部分层的 LoRA)
+    peft_full_model.load_state_dict(adapter_lora_state, strict=False)
+    
+    # 移动到 GPU 进行评估
+    peft_full_model.to(accelerator.device)
+    peft_full_model.eval()
+    
+    total_loss = 0; steps = 0
     with torch.no_grad():
         for i, batch in enumerate(dataloader):
-            if i >= MAX_EVAL: break
+            if i >= 10: break
             batch = {k: v.to(accelerator.device) for k, v in batch.items()}
-            # [FIX] Conflict
+            # 清理冲突键
             batch.pop("labels", None); batch.pop("label", None)
+            
             labels = batch["input_ids"].clone()
-            if tokenizer and tokenizer.pad_token_id is not None: labels[labels == tokenizer.pad_token_id] = -100
-            outputs = full_model(**batch, labels=labels)
+            labels[labels == tokenizer.pad_token_id] = -100
+            
+            outputs = peft_full_model(**batch, labels=labels)
             total_loss += outputs.loss.item(); steps += 1
-    avg_loss = total_loss / steps if steps > 0 else 0.0
-    
-    full_model.cpu()
-    with torch.no_grad():
-        for real_idx, weights in original_weights.items(): full_layers[real_idx].load_state_dict(weights)
+            
+    # 4. 销毁副本，释放显存
+    del peft_full_model
+    del temp_full_model
     torch.cuda.empty_cache()
-    return avg_loss
+    
+    return total_loss / steps if steps > 0 else 0.0
 
 class VirtualClient:
     def __init__(self, client_id, train_loader, test_loader, label_dist_str):
         self.id = client_id; self.train_dataloader = train_loader; self.test_dataloader = test_loader; self.label_info = label_dist_str
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="FedRole")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-0.5B")
     parser.add_argument("--dataset_name", type=str, default="mixed_yelp_gsm8k")
     parser.add_argument("--num_clients", type=int, default=10)
@@ -258,7 +341,6 @@ def main():
     full_model = AutoModelForCausalLM.from_pretrained(args.model_name, config=config, trust_remote_code=True)
     full_model.cpu() 
     
-    # ... (Data Loading Omitted for Brevity - Same as before) ...
     clients = []
     half_clients = args.num_clients // 2
     ds_yelp = datasets.load_dataset("yelp_review_full", cache_dir=args.cache_dir)
@@ -268,7 +350,6 @@ def main():
     if "train" in ds_gsm: ds_gsm = ds_gsm["train"]
     ds_gsm = ds_gsm.select(range(min(len(ds_gsm), 5000))) 
     def tok_fn(text): return tokenizer(text, padding="max_length", truncation=True, max_length=64)
-    
     for i in range(half_clients):
         sub = ds_yelp.select(np.array_split(range(len(ds_yelp)), half_clients)[i])
         split = sub.train_test_split(test_size=0.1)
@@ -283,7 +364,6 @@ def main():
         test_ds = split['test'].map(lambda x: tok_fn(x['question']), batched=True)
         clients.append(VirtualClient(cid, DataLoader(train_ds, batch_size=4, collate_fn=default_data_collator, shuffle=True), DataLoader(test_ds, batch_size=4, collate_fn=default_data_collator), "GSM8K"))
 
-    # Sensitivity Profiling
     sensitivity_vectors = []
     full_model.to(accelerator.device); full_model.train()
     init_state = {k: v.clone().cpu() for k, v in full_model.state_dict().items()}
@@ -292,33 +372,29 @@ def main():
         avg_grad = np.zeros(len(get_module_layers(full_model)))
         valid = 0; iter_loader = iter(client.train_dataloader)
         for _ in range(3):
-            try: batch = next(iter_loader)
+            try: batch = next(iter_loader); batch = {k: v.to(accelerator.device) for k, v in batch.items()}; batch.pop("labels",None); batch.pop("label",None)
             except: break
-            batch = {k: v.to(accelerator.device) for k, v in batch.items()}
-            batch.pop("labels", None); batch.pop("label", None)
             full_model(**batch, labels=batch["input_ids"]).loss.backward()
             avg_grad += compute_layer_sensitivity(full_model, accelerator)
             valid += 1; full_model.zero_grad()
-        if valid > 0: avg_grad /= valid
+        if valid>0: avg_grad/=valid
         sensitivity_vectors.append(avg_grad)
     full_model.cpu()
-
-    # Clustering
-    if len(sensitivity_vectors) > 0:
-        labels = KMeans(n_clusters=min(args.num_clusters, len(sensitivity_vectors)), random_state=42, n_init=10).fit_predict(np.stack(sensitivity_vectors))
+    if len(sensitivity_vectors)>0: labels = KMeans(n_clusters=min(args.num_clusters,len(sensitivity_vectors)), random_state=42).fit_predict(np.stack(sensitivity_vectors))
     else: labels = []
     clusters = {i: [] for i in range(args.num_clusters)}
-    for i, label in enumerate(labels): clusters[label].append(clients[i])
+    for i, l in enumerate(labels): clusters[l].append(clients[i])
 
-    logger.info("=== [Step 3] Initializing Emulators ===")
-    cluster_initial_states = {}; cluster_layer_sens = {}
+    logger.info("=== [Step 3] Initializing Emulators with LoRA ===")
+    cluster_initial_states = {}; cluster_sens = {}
     for cid in range(args.num_clusters):
         c_idxs = [i for i, l in enumerate(labels) if l == cid]
         if not c_idxs: continue
         sens = np.mean(np.stack(sensitivity_vectors)[c_idxs], axis=0)
-        cluster_layer_sens[cid] = sens
+        cluster_sens[cid] = sens
         emu = create_custom_emulator(full_model, sens, args.layer_budget, args.src_budget)
-        cluster_initial_states[cid] = {k: v.clone().cpu() for k, v in emu.state_dict().items()}
+        trainable_keys = get_trainable_keys(emu)
+        cluster_initial_states[cid] = {k: v.clone().cpu() for k, v in emu.state_dict().items() if k in trainable_keys}
         del emu
 
     logger.info("=== [Step 4] Federated Training ===")
@@ -330,64 +406,50 @@ def main():
         for cid, c_clients in clusters.items():
             if not c_clients: continue
             
-            temp_model = create_custom_emulator(full_model, cluster_layer_sens[cid], args.layer_budget, args.src_budget)
-            temp_model.load_state_dict(cluster_global_states[cid])
+            temp_model = create_custom_emulator(full_model, cluster_sens[cid], args.layer_budget, args.src_budget)
+            temp_model.load_state_dict(cluster_global_states[cid], strict=False)
             temp_model.to(accelerator.device); temp_model.train()
             
-            # [FIX] Get keys that REALLY require grad
-            trainable_keys = get_trainable_keys(temp_model)
-            if round_idx == 0: logger.info(f"Cluster {cid} Trainable Params: {len(trainable_keys)}")
-
-            optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, temp_model.parameters()), lr=args.lr)
-            global_update = {}
-            cluster_train_loss = 0.0 # Track Emulator Loss
-            total_train_steps = 0
+            # Optimizer on Trainable Params
+            trainable_params = [p for p in temp_model.parameters() if p.requires_grad]
+            optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
             
-            current_cpu = {k: v.clone().cpu() for k, v in temp_model.state_dict().items()}
+            global_update = {}
+            current_cpu = {k: v.clone().cpu() for k, v in temp_model.state_dict().items() if k in cluster_global_states[cid]}
+            
+            emu_loss_accum = 0; emu_steps = 0
             
             for client in c_clients:
-                temp_model.load_state_dict(current_cpu)
-                optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, temp_model.parameters()), lr=args.lr)
-                optimizer.zero_grad()
-                
+                temp_model.load_state_dict(cluster_global_states[cid], strict=False)
                 for step, batch in enumerate(client.train_dataloader):
                     if step >= args.local_steps: break
                     batch = {k: v.to(accelerator.device) for k, v in batch.items()}
                     batch.pop("labels", None); batch.pop("label", None)
-                    labels = batch["input_ids"].clone()
-                    if tokenizer.pad_token_id is not None: labels[labels == tokenizer.pad_token_id] = -100
+                    labels = batch["input_ids"].clone(); labels[labels==tokenizer.pad_token_id] = -100
                     
                     outputs = temp_model(**batch, labels=labels)
                     loss = outputs.loss
                     loss.backward()
                     optimizer.step(); optimizer.zero_grad()
-                    
-                    cluster_train_loss += loss.item()
-                    total_train_steps += 1
+                    emu_loss_accum += loss.item(); emu_steps += 1
                 
-                # [FIX] Aggregation Logic
+                # Aggregate Only Trainable
                 client_state = temp_model.state_dict()
-                for key in trainable_keys:
-                    if key in client_state:
-                        delta = client_state[key].cpu() - current_cpu[key]
-                        global_update[key] = global_update.get(key, 0) + delta
+                for key in current_cpu:
+                    delta = client_state[key].cpu() - current_cpu[key]
+                    global_update[key] = global_update.get(key, 0) + delta
             
-            # Apply Update
             if global_update:
                 for key in global_update:
-                    if key in cluster_global_states[cid]:
-                        cluster_global_states[cid][key] += global_update[key] / len(c_clients)
+                    cluster_global_states[cid][key] += global_update[key] / len(c_clients)
             
-            # Eval (Smart Plug-back)
-            # Load updated state into temp_model to pass to eval function (which checks original_layer_idx)
-            temp_model.load_state_dict(cluster_global_states[cid])
+            # Eval
+            temp_model.load_state_dict(cluster_global_states[cid], strict=False)
             plug_loss = evaluate_full_model_plugback(full_model, temp_model, c_clients[0].test_dataloader, accelerator, tokenizer)
             
-            avg_emu_loss = cluster_train_loss / total_train_steps if total_train_steps > 0 else 0.0
-            
-            logger.info(f"Cluster {cid} | Emulator Train Loss: {avg_emu_loss:.4f} | Plug-in Eval Loss: {plug_loss:.4f}")
-            round_metrics[f"cluster_{cid}_emu_loss"] = avg_emu_loss
-            round_metrics[f"cluster_{cid}_plugin_loss"] = plug_loss
+            avg_emu = emu_loss_accum / emu_steps if emu_steps > 0 else 0
+            logger.info(f"Cluster {cid} | Emu: {avg_emu:.4f} | Plug: {plug_loss:.4f}")
+            round_metrics[f"c{cid}_emu"] = avg_emu; round_metrics[f"c{cid}_plug"] = plug_loss
             
             del temp_model; torch.cuda.empty_cache()
 
