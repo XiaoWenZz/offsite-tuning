@@ -16,7 +16,7 @@ from transformers import (
 )
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-import wandb  # === [新增] ===
+import wandb
 
 # 设置日志
 logger = get_logger(__name__)
@@ -66,7 +66,8 @@ def plugin_adapter_to_full_model(full_model, adapted_emulator, layer_mapping):
         full_layers[full_model_idx].load_state_dict(adapted_layers[emulator_idx].state_dict())
     return full_model
 
-def evaluate_model(model, dataloader, device="cpu"):
+# [修改] 增加 tokenizer 参数以支持 padding mask
+def evaluate_model(model, dataloader, device="cpu", tokenizer=None):
     model.eval()
     model.to(device)
     total_loss = 0
@@ -74,7 +75,13 @@ def evaluate_model(model, dataloader, device="cpu"):
     with torch.no_grad():
         for batch in dataloader:
             batch = {k: v.to(device) for k, v in batch.items()}
-            outputs = model(**batch, labels=batch["input_ids"])
+            
+            # [Fix] Mask Padding
+            labels = batch["input_ids"].clone()
+            if tokenizer is not None and tokenizer.pad_token_id is not None:
+                labels[labels == tokenizer.pad_token_id] = -100
+                
+            outputs = model(**batch, labels=labels)
             total_loss += outputs.loss.item()
             steps += 1
             if steps >= 20: break 
@@ -87,6 +94,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run Baseline Offsite-Tuning")
     parser.add_argument("--model_name", type=str, default="facebook/opt-125m")
     parser.add_argument("--dataset_name", type=str, default="ag_news")
+    
+    # === [新增] 通用化参数 ===
+    parser.add_argument("--text_column", type=str, default="text", help="The name of the column containing the text.")
+    parser.add_argument("--label_column", type=str, default="label", help="The name of the column containing the label.")
+    parser.add_argument("--cache_dir", type=str, default=None, help="Directory to cache the dataset.")
+    
     parser.add_argument("--keep_layers", type=int, default=2)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--epochs", type=int, default=1)
@@ -126,18 +139,54 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
     full_model = AutoModelForCausalLM.from_pretrained(args.model_name, config=config)
     
-    # 评估基准数据 (Target Label = 1, Sports)
-    dataset = datasets.load_dataset(args.dataset_name, split="train[:1000]")
+    # === [Modification] 数据加载与标准化逻辑 ===
+    logger.info(f"Loading dataset {args.dataset_name} with cache_dir={args.cache_dir}...")
+    dataset = datasets.load_dataset(args.dataset_name, cache_dir=args.cache_dir)
+    
+    # 1. 自动处理 DatasetDict
+    if isinstance(dataset, datasets.DatasetDict):
+        if "train" in dataset:
+            dataset = dataset["train"]
+        else:
+            dataset = dataset[list(dataset.keys())[0]]
+
+    # 2. 列名标准化 (先重命名，再 Filter)
+    logger.info(f"Target columns: Text='{args.text_column}', Label='{args.label_column}'")
+    
+    if args.text_column not in dataset.column_names:
+        raise ValueError(f"Column '{args.text_column}' not found. Available: {dataset.column_names}")
+    if args.label_column not in dataset.column_names:
+        raise ValueError(f"Column '{args.label_column}' not found. Available: {dataset.column_names}")
+
+    if args.text_column != "text":
+        dataset = dataset.rename_column(args.text_column, "text")
+    if args.label_column != "label":
+        dataset = dataset.rename_column(args.label_column, "label")
+
+    # 3. 模拟 Non-IID: 只选取 Label=1 的数据 (模拟单个特定的 Client)
+    logger.info("Filtering dataset for label == 1 to simulate single client Non-IID...")
+    # 注意：这里假设 dataset['label'] 是数字。如果数据太大，filter可能会慢。
     client_dataset = dataset.filter(lambda x: x['label'] == 1) 
     
+    # 4. 自动切片 (防止单类数据依然过多)
+    if len(client_dataset) > 5000:
+        logger.info(f"Filtered dataset is large ({len(client_dataset)}), slicing first 5,000 examples.")
+        client_dataset = client_dataset.select(range(5000))
+    
+    logger.info(f"Client dataset size: {len(client_dataset)}")
+
     def tokenize_fn(examples):
         return tokenizer(examples['text'], padding="max_length", truncation=True, max_length=64)
     
+    # 移除标准化后的列名 'text', 'label'
     tokenized_ds = client_dataset.map(tokenize_fn, batched=True, remove_columns=['text', 'label'])
-    client_loader = DataLoader(tokenized_ds, batch_size=args.batch_size, collate_fn=default_data_collator)
+    
+    # [Fix] 开启 Shuffle
+    client_loader = DataLoader(tokenized_ds, batch_size=args.batch_size, collate_fn=default_data_collator, shuffle=True)
     
     logger.info("Evaluating Original Full Model (Zero-shot)...")
-    original_loss = evaluate_model(full_model, client_loader, accelerator.device)
+    # [Fix] 传入 tokenizer
+    original_loss = evaluate_model(full_model, client_loader, accelerator.device, tokenizer)
     logger.info(f"Original Full Model Loss: {original_loss:.4f}")
     
     if accelerator.is_main_process:
@@ -157,7 +206,13 @@ def main():
     for epoch in range(args.epochs):
         for step, batch in enumerate(client_loader):
             optimizer.zero_grad()
-            outputs = emulator(**batch, labels=batch["input_ids"])
+            
+            # [Fix] Mask Padding
+            labels = batch["input_ids"].clone()
+            if tokenizer.pad_token_id is not None:
+                labels[labels == tokenizer.pad_token_id] = -100
+            
+            outputs = emulator(**batch, labels=labels)
             loss = outputs.loss
             accelerator.backward(loss)
             optimizer.step()
@@ -174,7 +229,8 @@ def main():
     full_model.to(accelerator.device)
     adapted_full_model = plugin_adapter_to_full_model(full_model, trained_emulator_unwrapped, layer_mapping)
     
-    final_loss = evaluate_model(adapted_full_model, client_loader, accelerator.device)
+    # [Fix] 传入 tokenizer
+    final_loss = evaluate_model(adapted_full_model, client_loader, accelerator.device, tokenizer)
     improvement = original_loss - final_loss
     
     logger.info(f"Final Loss: {final_loss:.4f}, Improvement: {improvement:.4f}")

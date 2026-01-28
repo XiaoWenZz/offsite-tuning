@@ -100,6 +100,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run Vanilla Federated Offsite-Tuning (FedOT)")
     parser.add_argument("--model_name", type=str, default="facebook/opt-125m")
     parser.add_argument("--dataset_name", type=str, default="ag_news")
+    parser.add_argument("--text_column", type=str, default="text")
+    parser.add_argument("--label_column", type=str, default="label")
     parser.add_argument("--num_clients", type=int, default=4)
     # alpha 越小，Non-IID 越严重，Vanilla FedOT 的效果通常越差
     parser.add_argument("--alpha", type=float, default=0.1, help="Dirichlet alpha for Non-IID")
@@ -111,6 +113,9 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--wandb_project", type=str, default="fed_offsite_tuning")
     parser.add_argument("--wandb_run_name", type=str, default="vanilla_fedot")
+
+    parser.add_argument("--cache-dir", type=str, default=None, help="Directory to cache the dataset.")
+
     return parser.parse_args()
 
 # ==========================================
@@ -136,7 +141,52 @@ def main():
     model = accelerator.prepare(emulator)
 
     # 2. 准备数据与客户端
-    dataset = datasets.load_dataset(args.dataset_name, split="train[:2000]")
+     # Prepare Data
+    logger.info(f"Loading dataset {args.dataset_name} with cache_dir={args.cache_dir}...")
+    
+    # 通用加载逻辑 (结合之前的修改)
+    # ... (args = parse_args() 等代码) ...
+
+    # Prepare Data
+    # 这一步如果不加 split 参数，对于 Yelp 会返回 {'train': ..., 'test': ...}
+    dataset = datasets.load_dataset(args.dataset_name, cache_dir=args.cache_dir)
+
+    # === [关键修复] 处理 DatasetDict ===
+    # 如果加载出来的是个字典（包含 train/test），我们只取 train 部分
+    if isinstance(dataset, datasets.DatasetDict):
+        if "train" in dataset:
+            dataset = dataset["train"]
+        else:
+            # 如果没有 train，就取第一个 split
+            dataset = dataset[list(dataset.keys())[0]]
+            
+    # === [优化] 大数据集切片 ===
+    # Yelp 有 65万条，全量跑太慢，这里保留之前的逻辑，只取前 2万条
+    if len(dataset) > 20000:
+        logger.info(f"Dataset is too large ({len(dataset)}), slicing first 20,000 examples.")
+        dataset = dataset.select(range(20000))
+
+    # === [Modification] 基于参数的列名标准化 (No Hard-coding) ===
+    logger.info(f"Target columns from args: Text='{args.text_column}', Label='{args.label_column}'")    
+    
+    # 1. 检查列名是否存在
+    if args.text_column not in dataset.column_names:
+        raise ValueError(f"Column '{args.text_column}' not found in dataset. Available columns: {dataset.column_names}")
+    
+    # 部分数据集可能没有 label 列（如果是纯无监督训练），这里做一个容错，或者强制要求
+    if args.label_column not in dataset.column_names:
+         raise ValueError(f"Column '{args.label_column}' not found in dataset. Available columns: {dataset.column_names}")
+
+    # 2. 统一重命名为内部通用的 'text' 和 'label'
+    # 这样后续的 tokenizer 和 partition 逻辑都不用改
+    if args.text_column != "text":
+        dataset = dataset.rename_column(args.text_column, "text")
+        logger.info(f"Renamed column '{args.text_column}' -> 'text'")
+    
+    if args.label_column != "label":
+        dataset = dataset.rename_column(args.label_column, "label")
+        logger.info(f"Renamed column '{args.label_column}' -> 'label'")
+
     client_indices = partition_data_dirichlet(dataset, args.num_clients, alpha=args.alpha)
     
     clients = []
