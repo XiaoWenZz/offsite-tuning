@@ -24,7 +24,6 @@ from peft import get_peft_model, LoraConfig, TaskType, PeftModel
 
 logger = get_logger(__name__)
 
-# [Harmonizer Identical to FedRole]
 class Harmonizer(nn.Module):
     def __init__(self, config, rank=128, target_attention_type="full"):
         super().__init__()
@@ -51,7 +50,7 @@ class Harmonizer(nn.Module):
         x = self.up_proj(x)
         return x + residual 
 
-# [Helpers Identical to FedRole]
+# Helpers
 def get_module_layers(model):
     obj = model
     if hasattr(obj, "base_model"): obj = obj.base_model
@@ -77,6 +76,20 @@ def set_module_layers(model, new_layers):
         return
     raise ValueError(f"Unknown model architecture: {type(model)}")
 
+def compute_layer_sensitivity(model, accelerator):
+    layers = get_module_layers(model)
+    num_layers = len(layers)
+    sensitivity_vector = np.zeros(num_layers)
+    for i, layer in enumerate(layers):
+        grad_sum = 0.0
+        for param in layer.parameters():
+            if param.grad is not None:
+                grad_sum += param.grad.detach().float().norm(2).item()
+        sensitivity_vector[i] = grad_sum
+    norm = np.linalg.norm(sensitivity_vector)
+    if norm > 0: sensitivity_vector = sensitivity_vector / norm
+    return sensitivity_vector
+
 def get_trainable_keys(model):
     keys = []
     for name, param in model.named_parameters():
@@ -84,7 +97,6 @@ def get_trainable_keys(model):
     return set(keys)
 
 def create_emulator(full_model, budget=4):
-    """Baseline Emulator Construction"""
     emulator = copy.deepcopy(full_model)
     layers = get_module_layers(emulator)
     total = len(layers)
@@ -95,7 +107,6 @@ def create_emulator(full_model, budget=4):
         if rem == 1: indices.add(total//2)
         else: indices.update(np.linspace(1, total-2, rem, dtype=int))
     adapter_indices = sorted(list(indices))
-    
     new_layers = []
     curr = 0
     ref_type = getattr(layers[0], "attention_type", "full")
@@ -110,47 +121,64 @@ def create_emulator(full_model, budget=4):
             while (curr + gap < total) and (curr + gap not in adapter_indices): gap += 1
             new_layers.append(Harmonizer(full_model.config, 128, ref_type))
             curr += gap
-            
     set_module_layers(emulator, nn.ModuleList(new_layers))
     emulator.config.use_cache = False
     
-    # [Config Map]
     layer_map = {}
     for i, layer in enumerate(new_layers):
         if hasattr(layer, "original_layer_idx") and layer.original_layer_idx is not None:
             layer_map[i] = layer.original_layer_idx
     emulator.config.layer_map = layer_map
     
-    # [LoRA]
     for param in emulator.parameters(): param.requires_grad = False
     peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, r=8, lora_alpha=32, target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
     emulator = get_peft_model(emulator, peft_config)
     if hasattr(emulator, "config"): emulator.config.layer_map = layer_map
-    
     for name, param in emulator.named_parameters():
         if "Harmonizer" in name or "lora_" in name: param.requires_grad = True
         else: param.requires_grad = False
     return emulator
 
+def server_side_alignment(full_model, emulator, tokenizer, accelerator, num_steps=30):
+    logger.info("⚡ Baseline Alignment...")
+    raw_datasets = [{"text": "The quick brown fox jumps over the lazy dog. " * 10} for _ in range(100)]
+    def tokenize_function(examples): return tokenizer(examples["text"], truncation=True, max_length=128, padding="max_length")
+    tokenized_datasets = [tokenize_function(x) for x in raw_datasets]
+    input_ids = torch.tensor([t['input_ids'] for t in tokenized_datasets])
+    attention_mask = torch.tensor([t['attention_mask'] for t in tokenized_datasets])
+    align_loader = DataLoader(list(zip(input_ids, attention_mask)), batch_size=4, shuffle=True, collate_fn=lambda x: {"input_ids": torch.stack([i[0] for i in x]), "attention_mask": torch.stack([i[1] for i in x])})
+
+    full_model.eval(); full_model.to(accelerator.device)
+    emulator.train(); emulator.to(accelerator.device)
+    params = [p for n, p in emulator.named_parameters() if "Harmonizer" in n]
+    if not params: return
+    optimizer = torch.optim.AdamW(params, lr=1e-3)
+    loss_fct = nn.KLDivLoss(reduction="batchmean")
+
+    iterator = iter(align_loader)
+    for step in range(num_steps):
+        try: batch = next(iterator)
+        except: iterator = iter(align_loader); batch = next(iterator)
+        batch = {k: v.to(accelerator.device) for k, v in batch.items()}
+        with torch.no_grad(): teacher_logits = full_model(**batch).logits
+        student_logits = emulator(**batch).logits
+        loss = loss_fct(torch.nn.functional.log_softmax(student_logits, dim=-1), torch.nn.functional.softmax(teacher_logits, dim=-1))
+        loss.backward(); optimizer.step(); optimizer.zero_grad()
+    for name, param in emulator.named_parameters():
+        if "lora_" in name: param.requires_grad = True
+    torch.cuda.empty_cache()
+
 def evaluate_full_model_plugback(full_model, emulator_model, dataloader, accelerator, tokenizer):
-    """
-    Safe LoRA-aware Plug-back Evaluation.
-    Uses a COPY of full_model to prevent contaminating the base model with adapters.
-    """
-    # 1. 提取 Emulator 的 LoRA 权重 & 建立映射
     emu_state = emulator_model.state_dict()
     adapter_lora_state = {}
     
-    # 获取层号映射表
     idx_map = {}
-    # Check wrapper config first
     if hasattr(emulator_model, "config") and hasattr(emulator_model.config, "layer_map"):
         idx_map = emulator_model.config.layer_map
     elif hasattr(emulator_model, "base_model") and hasattr(emulator_model.base_model.model, "config"):
         if hasattr(emulator_model.base_model.model.config, "layer_map"):
             idx_map = emulator_model.base_model.model.config.layer_map
             
-    # 重映射 LoRA Key
     mapped_count = 0
     for k, v in emu_state.items():
         if "lora_" in k:
@@ -159,76 +187,36 @@ def evaluate_full_model_plugback(full_model, emulator_model, dataloader, acceler
                 if 'layers' in parts:
                     layer_kw_idx = parts.index('layers')
                     emu_layer_idx = int(parts[layer_kw_idx + 1])
-                    
                     if emu_layer_idx in idx_map:
                         real_idx = idx_map[emu_layer_idx]
                         parts[layer_kw_idx + 1] = str(real_idx)
                         new_key = ".".join(parts)
-                        adapter_lora_state[new_key] = v.cpu() # 确保在 CPU
+                        adapter_lora_state[new_key] = v.cpu()
                         mapped_count += 1
             except: continue
-
-    # [Debug Print]
+            
     if not hasattr(evaluate_full_model_plugback, "debug_printed"):
-        print(f"🔥 Plug-back: Mapped {mapped_count} keys to Full Model.")
+        print(f"🔥 Plug-back: Mapped {mapped_count} keys.")
         evaluate_full_model_plugback.debug_printed = True
 
-    # 2. [CRITICAL FIX] 创建 Full Model 的临时副本
-    # 我们不能直接修改 full_model，因为 get_peft_model 是 In-place 操作
-    # Qwen-1.5B 复制一份约为 3GB 内存，这比污染基座模型要安全得多
-    temp_full_model = copy.deepcopy(full_model)
-    
-    # 3. 挂载 LoRA 到副本上
-    peft_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM, 
-        r=8, 
-        lora_alpha=32, 
-        target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-    )
-    
-    # Wrap copy
-    peft_full_model = get_peft_model(temp_full_model, peft_config)
-        
-    # 加载重映射后的权重 (Strict=False 是必须的，因为我们只有部分层的 LoRA)
-    peft_full_model.load_state_dict(adapter_lora_state, strict=False)
-    
-    # 移动到 GPU 进行评估
-    peft_full_model.to(accelerator.device)
-    peft_full_model.eval()
+    temp_full = copy.deepcopy(full_model)
+    peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, r=8, lora_alpha=32, target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
+    peft_full = get_peft_model(temp_full, peft_config)
+    peft_full.load_state_dict(adapter_lora_state, strict=False)
+    peft_full.to(accelerator.device); peft_full.eval()
     
     total_loss = 0; steps = 0
     with torch.no_grad():
         for i, batch in enumerate(dataloader):
             if i >= 10: break
             batch = {k: v.to(accelerator.device) for k, v in batch.items()}
-            # 清理冲突键
             batch.pop("labels", None); batch.pop("label", None)
-            
-            labels = batch["input_ids"].clone()
-            labels[labels == tokenizer.pad_token_id] = -100
-            
-            outputs = peft_full_model(**batch, labels=labels)
+            labels = batch["input_ids"].clone(); labels[labels == tokenizer.pad_token_id] = -100
+            outputs = peft_full(**batch, labels=labels)
             total_loss += outputs.loss.item(); steps += 1
             
-    # 4. 销毁副本，释放显存
-    del peft_full_model
-    del temp_full_model
-    torch.cuda.empty_cache()
-    
+    del peft_full; del temp_full; torch.cuda.empty_cache()
     return total_loss / steps if steps > 0 else 0.0
-
-def compute_layer_sensitivity(model, accelerator):
-    layers = get_module_layers(model)
-    num_layers = len(layers)
-    sensitivity_vector = np.zeros(num_layers)
-    for i, layer in enumerate(layers):
-        grad_sum = 0.0
-        for param in layer.parameters():
-            if param.grad is not None: grad_sum += param.grad.detach().float().norm(2).item()
-        sensitivity_vector[i] = grad_sum
-    norm = np.linalg.norm(sensitivity_vector)
-    if norm > 0: sensitivity_vector = sensitivity_vector / norm
-    return sensitivity_vector
 
 class VirtualClient:
     def __init__(self, client_id, train_loader, test_loader, label_dist_str):
@@ -263,7 +251,6 @@ def main():
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
     config = AutoConfig.from_pretrained(args.model_name, trust_remote_code=True)
     full_model = AutoModelForCausalLM.from_pretrained(args.model_name, config=config, trust_remote_code=True)
-    
     base_emulator = create_emulator(full_model, budget=args.layer_budget)
     full_model.cpu() 
     
@@ -311,11 +298,19 @@ def main():
     clusters = {i: [] for i in range(args.num_clusters)}
     for i, l in enumerate(labels): clusters[l].append(clients[i])
 
-    logger.info("=== [Step 3] Baseline Training (LoRA + Harmonizer) ===")
+    logger.info("=== [Step 3] Baseline Training (LoRA + Harmonizer + Alignment) ===")
     trainable_keys = get_trainable_keys(base_emulator)
     init_emu_state = {k: v.clone().detach().cpu() for k, v in base_emulator.state_dict().items() if k in trainable_keys}
     cluster_global_states = {k: copy.deepcopy(init_emu_state) for k in range(args.num_clusters)}
     
+    # Initialize Alignment for Baseline Emulators
+    for cid in range(args.num_clusters):
+        emu = create_emulator(full_model, args.layer_budget)
+        server_side_alignment(full_model, emu, tokenizer, accelerator, num_steps=30)
+        trainable_keys = get_trainable_keys(emu)
+        cluster_global_states[cid] = {k: v.clone().cpu() for k, v in emu.state_dict().items() if k in trainable_keys}
+        del emu
+
     for round_idx in range(args.rounds):
         logger.info(f"--- Round {round_idx + 1} ---")
         round_metrics = {}
@@ -326,11 +321,9 @@ def main():
             training_model.load_state_dict(cluster_global_states[cid], strict=False)
             training_model.to(accelerator.device); training_model.train()
             
-            trainable_params = [p for p in training_model.parameters() if p.requires_grad]
-            optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
+            optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, training_model.parameters()), lr=args.lr)
             global_update = {}
             current_cpu = {k: v.clone().cpu() for k, v in training_model.state_dict().items() if k in cluster_global_states[cid]}
-            
             emu_loss = 0; emu_steps = 0
             
             for client in c_clients:
@@ -358,8 +351,8 @@ def main():
             
             training_model.load_state_dict(cluster_global_states[cid], strict=False)
             plug_loss = evaluate_full_model_plugback(full_model, training_model, c_clients[0].test_dataloader, accelerator, tokenizer)
-            avg_emu = emu_loss / emu_steps if emu_steps > 0 else 0
             
+            avg_emu = emu_loss / emu_steps if emu_steps > 0 else 0
             logger.info(f"Cluster {cid} | Emu: {avg_emu:.4f} | Plug: {plug_loss:.4f}")
             round_metrics[f"c{cid}_emu"] = avg_emu; round_metrics[f"c{cid}_plug"] = plug_loss
             del training_model; del optimizer; torch.cuda.empty_cache()
