@@ -1,5 +1,7 @@
 #!/bin/bash
 
+
+cd ~/offsite-tuning/new_scripts/fedRole
 # =========================================================
 # 0. 环境配置
 # =========================================================
@@ -21,11 +23,11 @@ else
 fi
 
 # =========================================================
-# 1. 实验变量配置 (针对 ScaleOT 复现优化)
+# 1. 实验变量配置
 # =========================================================
 MODEL="Qwen/Qwen2.5-1.5B" 
 
-# [修改] 数据集改为 ScaleOT 标准 benchmark
+# [建议确认] 名字改对，方便看日志
 DATASET="mixed_piqa_hellaswag" 
 
 CACHE_DIR="/data/xiaowen"
@@ -34,18 +36,15 @@ NUM_CLIENTS=10
 NUM_CLUSTERS=2      
 ALPHA=0.1           
 
-# [修改] 增加轮数，因为 LoRA 收敛比全量微调慢
+# [建议确认] 轮数稍微多一点，给 LoRA 收敛时间
 ROUNDS=20           
-
-# [修改] 增加本地步数，让 Client 学得更充分
 LOCAL_STEPS=10      
 
-# [修改] LoRA 学习率通常比全量微调大 (3e-4 或 5e-4)
+# [关键修改] LoRA 建议用稍大的学习率 (3e-4 ~ 5e-4)
 LR="3e-4"           
 
 LAYER_BUDGET=6
 
-# [修改] 项目名称区分
 export WANDB_PROJECT="fedrole_scaleot_reproduction"
 
 cd ../..

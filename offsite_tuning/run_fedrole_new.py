@@ -3,6 +3,7 @@ import logging
 import sys
 import copy
 import random
+import math
 import numpy as np
 from sklearn.cluster import KMeans
 import torch
@@ -25,7 +26,7 @@ from peft import get_peft_model, LoraConfig, TaskType, PeftModel
 logger = get_logger(__name__)
 
 # ==========================================
-# [组件] Harmonizer & SRC (ScaleOT)
+# [组件] Harmonizer & SRC
 # ==========================================
 class Harmonizer(nn.Module):
     def __init__(self, config, rank=128, target_attention_type="full"):
@@ -35,10 +36,13 @@ class Harmonizer(nn.Module):
         self.down_proj = nn.Linear(self.input_dim, self.rank)
         self.activation = nn.ReLU()
         self.up_proj = nn.Linear(self.rank, self.input_dim)
+        
+        # Zero Init -> Identity Start
         nn.init.zeros_(self.down_proj.weight)
         nn.init.zeros_(self.up_proj.weight)
         nn.init.zeros_(self.up_proj.bias)
         nn.init.zeros_(self.down_proj.bias)
+        
         self.attention_type = target_attention_type
         self.layer_idx = 0 
         self.original_layer_idx = None
@@ -47,6 +51,7 @@ class Harmonizer(nn.Module):
         x = hidden_states
         while isinstance(x, tuple): x = x[0]
         if not isinstance(x, torch.Tensor): return x
+        
         residual = x
         x = self.down_proj(x)
         x = self.activation(x)
@@ -131,96 +136,67 @@ def get_trainable_keys(model):
     return set(keys)
 
 # ==========================================
-# [FIXED] Network-Proof Benchmark Loader
+# [关键] Local Benchmark Loader
 # ==========================================
 def load_benchmark_data(dataset_name, tokenizer, cache_dir=None, num_samples=1000):
     logger.info(f"📚 Loading Benchmark: {dataset_name}...")
     
-    # 候选数据集列表
-    candidate_datasets = []
+    # 定义本地路径
+    BASE_DIR = "/data/xiaowen/piqa_local/physicaliqa-train-dev"
+    DATA_PATH = os.path.join(BASE_DIR, "train.jsonl")
+    LABEL_PATH = os.path.join(BASE_DIR, "train-labels.lst")
     
-    # Task A Candidates
-    if dataset_name == "piqa": 
-        candidate_datasets = [
-            ("ai2_arc", "ARC-Easy", "question", "answerKey"), 
-            ("sciq", None, "question", "correct_answer"),
-            # WikiText 作为最后的网络尝试
-            ("wikitext", "wikitext-2-v1", "text", None) 
-        ]
-    # Task B Candidates
-    elif dataset_name == "hellaswag":
-        candidate_datasets = [
-            ("winogrande", "winogrande_xl", "sentence", "option1"),
-            ("openbookqa", "main", "question_stem", "answerKey"),
-            ("wikitext", "wikitext-2-v1", "text", None)
-        ]
-    else:
-        candidate_datasets = [("wikitext", "wikitext-2-v1", "text", None)]
+    ds = None
+    data_source_type = "unknown"
 
-    selected_ds = None
-    
-    # 1. 尝试网络加载
-    for name, subset, feat_q, feat_a in candidate_datasets:
-        try:
-            logger.info(f"   Trying to load {name} ({subset})...")
-            if subset:
-                ds = datasets.load_dataset(name, subset, split="train", cache_dir=cache_dir)
-            else:
-                ds = datasets.load_dataset(name, split="train", cache_dir=cache_dir)
+    # Case A: PIQA / Hellaswag -> 优先读本地 PIQA
+    if dataset_name == "piqa" or dataset_name == "hellaswag":
+        if os.path.exists(DATA_PATH) and os.path.exists(LABEL_PATH):
+            logger.info(f"   🏠 Found local PIQA files at {BASE_DIR}")
             
-            ds = ds.select(range(min(len(ds), num_samples)))
-            selected_ds = (ds, name, feat_q, feat_a)
-            logger.info(f"   ✅ Successfully loaded {name}")
-            break
-        except Exception as e:
-            logger.warning(f"   ❌ Failed to load {name}: {e}")
-            continue
-    
-    # 2. [终极保底] 本地合成数据 (无需网络)
-    if selected_ds is None:
-        logger.warning("🚨 All network downloads failed. Generating LOCAL SYNTHETIC data.")
-        # 生成一些看起来像句子的假数据，确保代码能跑通
-        dummy_data = [
-            {"text": "The quick brown fox jumps over the lazy dog. " * 5} 
-            for _ in range(num_samples)
-        ]
-        # 转换为 HuggingFace Dataset 对象
-        ds = datasets.Dataset.from_list(dummy_data)
-        selected_ds = (ds, "synthetic", "text", None)
-
-    ds, name, feat_q, feat_a = selected_ds
-
-    # 3. 格式化逻辑
-    def format_fn(ex):
-        # Synthetic / WikiText
-        if name in ["synthetic", "wikitext"]:
-            text = ex[feat_q]
-            if len(text) < 10: text = "Padding text for safety."
+            # 1. 加载文本
+            ds_text = datasets.load_dataset("json", data_files={"train": DATA_PATH}, split="train")
             
-        # AI2_ARC / OpenBookQA / SciQ
-        elif name in ["ai2_arc", "openbookqa", "sciq"]:
-            try:
-                # 处理选择题逻辑
-                if name == "sciq":
-                    ans = ex[feat_a]
-                else:
-                    choices = ex['choices']['text']
-                    labels = ex['choices']['label']
-                    correct_idx = labels.index(ex[feat_a])
-                    ans = choices[correct_idx]
-                text = f"Question: {ex[feat_q]}\nAnswer: {ans}"
-            except: 
-                text = f"Question: {ex[feat_q]}" # Fallback if parsing fails
-        
-        # Winogrande
-        elif name == "winogrande":
-            ans_idx = 0 if ex['answer'] == '1' else 1
-            ans = ex['option1'] if ans_idx == 0 else ex['option2']
-            text = f"Context: {ex[feat_q]}\nCompletion: {ans}"
+            # 2. 加载标签
+            with open(LABEL_PATH, "r") as f:
+                labels = [int(line.strip()) for line in f.readlines()]
             
+            # 3. 合并
+            min_len = min(len(ds_text), len(labels))
+            ds_text = ds_text.select(range(min_len))
+            labels = labels[:min_len]
+            ds = ds_text.add_column("label", labels)
+            
+            data_source_type = "piqa_local"
         else:
-            text = str(ex)
+            logger.warning(f"   ⚠️ Local file not found at {DATA_PATH}, trying network...")
+            try:
+                ds = datasets.load_dataset(dataset_name, split="train", cache_dir=cache_dir)
+                data_source_type = "network"
+            except: pass
 
+    # Case B: 终极保底
+    if ds is None:
+        logger.warning("🚨 ALL LOADS FAILED. Generating SYNTHETIC data.")
+        ds = datasets.Dataset.from_list([{"text": "The quick brown fox jumps over the lazy dog."}] * num_samples)
+        data_source_type = "synthetic"
+
+    # 截取
+    ds = ds.select(range(min(len(ds), num_samples)))
+    logger.info(f"   ✅ Loaded source: {data_source_type} | Size: {len(ds)}")
+
+    # 格式化
+    def format_fn(ex):
+        if data_source_type == "piqa_local":
+            label = ex['label']
+            correct_sol = ex['sol1'] if label == 0 else ex['sol2']
+            text = f"Goal: {ex['goal']}\nSolution: {correct_sol}"
+        elif data_source_type == "network" and dataset_name == "hellaswag":
+            correct_ending = ex['endings'][int(ex['label'])]
+            text = f"Context: {ex['ctx']}\nEnding: {correct_ending}"
+        else:
+            content = ex.get('text', "")
+            text = content if len(content) > 10 else "Padding text."
         return tokenizer(text, truncation=True, max_length=128, padding="max_length")
 
     tokenized_ds = ds.map(format_fn, remove_columns=ds.column_names)
@@ -269,14 +245,15 @@ def create_custom_emulator(full_model, sensitivity_vector, budget_adapter=4, bud
     set_module_layers(emulator, nn.ModuleList(new_layers))
     emulator.config.use_cache = False
     
+    # Save Map
     layer_map = {}
     for i, layer in enumerate(new_layers):
         if hasattr(layer, "original_layer_idx") and layer.original_layer_idx is not None:
             layer_map[i] = layer.original_layer_idx
     emulator.config.layer_map = layer_map 
     
+    # LoRA
     for param in emulator.parameters(): param.requires_grad = False
-    
     peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, r=8, lora_alpha=32, target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
     emulator = get_peft_model(emulator, peft_config)
     if hasattr(emulator, "config"): emulator.config.layer_map = layer_map
@@ -287,33 +264,25 @@ def create_custom_emulator(full_model, sensitivity_vector, budget_adapter=4, bud
     return emulator
 
 def server_side_alignment(full_model, emulator, tokenizer, accelerator, num_steps=100):
-    """Alignment with Real Data (WikiText)"""
-    logger.info("⚡ Server-Side Alignment (WikiText)...")
+    """Alignment using Synthetic/WikiText to warm up Harmonizer"""
+    logger.info("⚡ Server-Side Alignment...")
+    # Generate simple synthetic data for alignment (just to learn identity mapping)
+    raw_ds = [{"text": "The quick brown fox jumps over the lazy dog. " * 20} for _ in range(200)]
     
-    # Try loading real WikiText
-    try:
-        raw_ds = datasets.load_dataset("wikitext", "wikitext-2-v1", split="train[:5%]")
-        # Filter empty lines
-        raw_ds = raw_ds.filter(lambda x: len(x['text']) > 50)
-    except:
-        logger.warning("Failed to load WikiText, using synthetic.")
-        raw_ds = [{"text": "The quick brown fox jumps over the lazy dog. " * 20} for _ in range(200)]
-        
     def tok(ex): return tokenizer(ex["text"], truncation=True, max_length=128, padding="max_length")
+    tokenized_ds = [tok(x) for x in raw_ds]
+    input_ids = torch.tensor([t['input_ids'] for t in tokenized_ds])
+    attention_mask = torch.tensor([t['attention_mask'] for t in tokenized_ds])
     
-    if isinstance(raw_ds, list):
-        tokenized_ds = [tok(x) for x in raw_ds]
-        input_ids = torch.tensor([t['input_ids'] for t in tokenized_ds])
-        attention_mask = torch.tensor([t['attention_mask'] for t in tokenized_ds])
-        align_loader = DataLoader(list(zip(input_ids, attention_mask)), batch_size=4, shuffle=True, collate_fn=lambda x: {"input_ids": torch.stack([i[0] for i in x]), "attention_mask": torch.stack([i[1] for i in x])})
-    else:
-        tokenized_ds = raw_ds.map(tok, batched=True, remove_columns=["text"])
-        align_loader = DataLoader(tokenized_ds, batch_size=4, shuffle=True, collate_fn=default_data_collator)
+    align_loader = DataLoader(
+        list(zip(input_ids, attention_mask)), 
+        batch_size=4, shuffle=True, 
+        collate_fn=lambda x: {"input_ids": torch.stack([i[0] for i in x]), "attention_mask": torch.stack([i[1] for i in x])}
+    )
 
     full_model.eval(); full_model.to(accelerator.device)
     emulator.train(); emulator.to(accelerator.device)
     
-    # Only train Harmonizer during alignment
     params = [p for n, p in emulator.named_parameters() if "Harmonizer" in n]
     if not params: return
     optimizer = torch.optim.AdamW(params, lr=1e-3)
@@ -324,8 +293,7 @@ def server_side_alignment(full_model, emulator, tokenizer, accelerator, num_step
         try: batch = next(iterator)
         except: iterator = iter(align_loader); batch = next(iterator)
         
-        batch = {k: v.to(accelerator.device) for k, v in batch.items() if k in ['input_ids', 'attention_mask']}
-        
+        batch = {k: v.to(accelerator.device) for k, v in batch.items()}
         with torch.no_grad(): teacher_logits = full_model(**batch).logits
         student_logits = emulator(**batch).logits
 
@@ -336,12 +304,12 @@ def server_side_alignment(full_model, emulator, tokenizer, accelerator, num_step
         loss.backward(); optimizer.step(); optimizer.zero_grad()
         if step % 20 == 0: logger.info(f"   Align Step {step} | Loss: {loss.item():.4f}")
 
-    # Reset Gradients for Training
     for name, param in emulator.named_parameters():
         if "lora_" in name: param.requires_grad = True
     torch.cuda.empty_cache()
 
 def evaluate_full_model_plugback(full_model, emulator_model, dataloader, accelerator, tokenizer):
+    """Safe LoRA Plug-back using COPY"""
     full_model.eval()
     emu_state = emulator_model.state_dict()
     adapter_lora_state = {}
@@ -373,6 +341,7 @@ def evaluate_full_model_plugback(full_model, emulator_model, dataloader, acceler
         print(f"🔥 Plug-back: Mapped {mapped_count} keys.")
         evaluate_full_model_plugback.debug_printed = True
 
+    # COPY FULL MODEL
     temp_full = copy.deepcopy(full_model)
     peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, r=8, lora_alpha=32, target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
     peft_full = get_peft_model(temp_full, peft_config)
@@ -399,7 +368,7 @@ class VirtualClient:
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-0.5B")
-    parser.add_argument("--dataset_name", type=str, default="mixed_piqa_hellaswag") # [Change] Default Name
+    parser.add_argument("--dataset_name", type=str, default="mixed_piqa_hellaswag")
     parser.add_argument("--num_clients", type=int, default=10)
     parser.add_argument("--num_clusters", type=int, default=2)
     parser.add_argument("--alpha", type=float, default=0.1)
@@ -432,27 +401,21 @@ def main():
     clients = []
     half_clients = args.num_clients // 2
     
-    # Task A: PIQA
+    # Task A: PIQA (Local)
     ds_a = load_benchmark_data("piqa", tokenizer, cache_dir=args.cache_dir, num_samples=2000)
-    
-    # Task B: HellaSwag
+    # Task B: HellaSwag (Fallback to PIQA Local if net fails)
     ds_b = load_benchmark_data("hellaswag", tokenizer, cache_dir=args.cache_dir, num_samples=2000)
     
-    # Create Clients
     for i in range(half_clients):
         sub = ds_a.select(np.array_split(range(len(ds_a)), half_clients)[i])
         split = sub.train_test_split(test_size=0.1)
-        clients.append(VirtualClient(i, 
-            DataLoader(split['train'], batch_size=4, collate_fn=default_data_collator, shuffle=True), 
-            DataLoader(split['test'], batch_size=4, collate_fn=default_data_collator), "PIQA"))
+        clients.append(VirtualClient(i, DataLoader(split['train'], batch_size=4, collate_fn=default_data_collator, shuffle=True), DataLoader(split['test'], batch_size=4, collate_fn=default_data_collator), "PIQA"))
             
     for i in range(args.num_clients - half_clients):
         cid = half_clients + i
         sub = ds_b.select(np.array_split(range(len(ds_b)), args.num_clients - half_clients)[i])
         split = sub.train_test_split(test_size=0.1)
-        clients.append(VirtualClient(cid, 
-            DataLoader(split['train'], batch_size=4, collate_fn=default_data_collator, shuffle=True), 
-            DataLoader(split['test'], batch_size=4, collate_fn=default_data_collator), "HellaSwag"))
+        clients.append(VirtualClient(cid, DataLoader(split['train'], batch_size=4, collate_fn=default_data_collator, shuffle=True), DataLoader(split['test'], batch_size=4, collate_fn=default_data_collator), "HellaSwag"))
 
     sensitivity_vectors = []
     full_model.to(accelerator.device); full_model.train()
@@ -485,7 +448,6 @@ def main():
         
         emu = create_custom_emulator(full_model, sens, args.layer_budget, args.src_budget)
         
-        # [NEW] Increased Alignment Steps (100)
         server_side_alignment(full_model, emu, tokenizer, accelerator, num_steps=100)
         
         trainable_keys = get_trainable_keys(emu)
@@ -536,9 +498,18 @@ def main():
             temp_model.load_state_dict(cluster_global_states[cid], strict=False)
             plug_loss = evaluate_full_model_plugback(full_model, temp_model, c_clients[0].test_dataloader, accelerator, tokenizer)
             
-            avg_emu = emu_loss / emu_steps if emu_steps > 0 else 0
-            logger.info(f"Cluster {cid} ({c_clients[0].label_info}) | Emu: {avg_emu:.4f} | Plug: {plug_loss:.4f}")
-            round_metrics[f"c{cid}_emu"] = avg_emu; round_metrics[f"c{cid}_plug"] = plug_loss
+            avg_emu = emu_loss / emu_steps if emu_steps > 0 else 0.0
+            
+            # [NEW] PPL Calc
+            try: emu_ppl = math.exp(avg_emu)
+            except: emu_ppl = float('inf')
+            try: plug_ppl = math.exp(plug_loss)
+            except: plug_ppl = float('inf')
+            
+            logger.info(f"Cluster {cid} | Emu: {avg_emu:.4f} (PPL: {emu_ppl:.2f}) | Plug: {plug_loss:.4f} (PPL: {plug_ppl:.2f})")
+            round_metrics[f"c{cid}_emu"] = avg_emu
+            round_metrics[f"c{cid}_plug"] = plug_loss
+            round_metrics[f"c{cid}_plug_ppl"] = plug_ppl
             del temp_model; torch.cuda.empty_cache()
 
         round_metrics["round"] = round_idx + 1
