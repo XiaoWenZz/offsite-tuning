@@ -34,7 +34,7 @@ LOCAL_STEPS=10
 LR="1e-4"           
 
 LAYER_BUDGET=6
-export WANDB_PROJECT="fedrole_scaleot_reproduction"
+export WANDB_PROJECT="fedrole_PIQA_HellaSwag"
 
 cd ../..
 echo "=================================================="
@@ -47,7 +47,7 @@ echo "=================================================="
 # =========================================================
 # 2. 实验 A: Baseline (Uniform + LoRA + Alignment)
 # =========================================================
-BASELINE_SCRIPT="offsite_tuning/run_cluster_clm_noniid_qwen_new.py" 
+BASELINE_SCRIPT="offsite_tuning/run_cluster_clm_noniid_qwen_new_acc.py" 
 EXP_NAME_BASELINE="Baseline_ScaleOT_C${NUM_CLUSTERS}_B${LAYER_BUDGET}"
 
 echo ">>> [1/2] Running Baseline: Uniform Stride"
@@ -79,7 +79,7 @@ echo "--------------------------------------------------"
 # =========================================================
 # 3. 实验 B: Ours (FedRole + LoRA + Alignment)
 # =========================================================
-OURS_SCRIPT="offsite_tuning/run_fedrole_new.py"
+OURS_SCRIPT="offsite_tuning/run_fedrole_new_acc.py"
 EXP_NAME_OURS="Ours_FedRole_ScaleOT_C${NUM_CLUSTERS}_B${LAYER_BUDGET}"
 
 echo ">>> [2/2] Running Ours: FedRole (Dynamic)"

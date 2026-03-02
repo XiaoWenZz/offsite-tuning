@@ -2,7 +2,6 @@ import argparse
 import logging
 import sys
 import copy
-import random
 import math
 import numpy as np
 from sklearn.cluster import KMeans
@@ -10,18 +9,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import datasets
-from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    default_data_collator,
-    set_seed,
-)
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, default_data_collator, set_seed
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 import wandb
 import os
-from peft import get_peft_model, LoraConfig, TaskType, PeftModel
+from peft import get_peft_model, LoraConfig, TaskType
 
 logger = get_logger(__name__)
 
@@ -38,20 +31,14 @@ class Harmonizer(nn.Module):
         nn.init.zeros_(self.up_proj.bias)
         nn.init.zeros_(self.down_proj.bias)
         self.attention_type = target_attention_type
-        self.layer_idx = 0 
         self.original_layer_idx = None
 
     def forward(self, hidden_states, *args, **kwargs):
         x = hidden_states
         while isinstance(x, tuple): x = x[0]
         if not isinstance(x, torch.Tensor): return x
-        residual = x
-        x = self.down_proj(x)
-        x = self.activation(x)
-        x = self.up_proj(x)
-        return x + residual 
+        return x + self.up_proj(self.activation(self.down_proj(x)))
 
-# Helpers
 def get_module_layers(model):
     obj = model
     if hasattr(obj, "base_model"): obj = obj.base_model
@@ -64,123 +51,137 @@ def get_module_layers(model):
 def set_module_layers(model, new_layers):
     if hasattr(model, "model"):
         if hasattr(model.model, "layers"): 
-            model.model.layers = new_layers
-            model.config.num_hidden_layers = len(new_layers)
-            return
-        elif hasattr(model.model, "decoder"): 
-            model.model.decoder.layers = new_layers
-            model.config.num_hidden_layers = len(new_layers)
-            return
-    if hasattr(model, "decoder"):
-        model.decoder.layers = new_layers
-        model.config.num_hidden_layers = len(new_layers)
-        return
-    raise ValueError(f"Unknown model architecture: {type(model)}")
-
-def compute_layer_sensitivity(model, accelerator):
-    layers = get_module_layers(model)
-    num_layers = len(layers)
-    sensitivity_vector = np.zeros(num_layers)
-    for i, layer in enumerate(layers):
-        grad_sum = 0.0
-        for param in layer.parameters():
-            if param.grad is not None:
-                grad_sum += param.grad.detach().float().norm(2).item()
-        sensitivity_vector[i] = grad_sum
-    norm = np.linalg.norm(sensitivity_vector)
-    if norm > 0: sensitivity_vector = sensitivity_vector / norm
-    return sensitivity_vector
+            model.model.layers = new_layers; model.config.num_hidden_layers = len(new_layers); return
+    if hasattr(model, "layers"):
+        model.layers = new_layers; model.config.num_hidden_layers = len(new_layers); return
+    raise ValueError(f"Unknown architecture for setting layers")
 
 def get_trainable_keys(model):
-    keys = []
-    for name, param in model.named_parameters():
-        if param.requires_grad: keys.append(name)
-    return set(keys)
+    return {n for n, p in model.named_parameters() if p.requires_grad}
 
-# ==========================================
-# [关键] Local Benchmark Loader (Identical)
-# ==========================================
 def load_benchmark_data(dataset_name, tokenizer, cache_dir=None, num_samples=1000):
-    logger.info(f"📚 Loading Benchmark: {dataset_name}...")
     BASE_DIR = "/data/xiaowen/piqa_local/physicaliqa-train-dev"
     DATA_PATH = os.path.join(BASE_DIR, "train.jsonl")
     LABEL_PATH = os.path.join(BASE_DIR, "train-labels.lst")
-    
-    ds = None
-    data_source_type = "unknown"
+    ds = None; data_source_type = "unknown"
 
     if dataset_name == "piqa" or dataset_name == "hellaswag":
         if os.path.exists(DATA_PATH) and os.path.exists(LABEL_PATH):
-            logger.info(f"   🏠 Found local PIQA files at {BASE_DIR}")
             ds_text = datasets.load_dataset("json", data_files={"train": DATA_PATH}, split="train")
             with open(LABEL_PATH, "r") as f: labels = [int(line.strip()) for line in f.readlines()]
             min_len = min(len(ds_text), len(labels))
-            ds_text = ds_text.select(range(min_len))
-            labels = labels[:min_len]
-            ds = ds_text.add_column("label", labels)
+            ds = ds_text.select(range(min_len)).add_column("label", labels[:min_len])
             data_source_type = "piqa_local"
         else:
-            try:
-                ds = datasets.load_dataset(dataset_name, split="train", cache_dir=cache_dir)
-                data_source_type = "network"
+            try: ds = datasets.load_dataset(dataset_name, split="train", cache_dir=cache_dir); data_source_type = "network"
             except: pass
 
     if ds is None:
-        ds = datasets.Dataset.from_list([{"text": "The quick brown fox jumps over the lazy dog."}] * num_samples)
-        data_source_type = "synthetic"
+        ds = datasets.Dataset.from_list([{"text": "The quick brown fox."}] * num_samples); data_source_type = "synthetic"
 
     ds = ds.select(range(min(len(ds), num_samples)))
     def format_fn(ex):
-        if data_source_type == "piqa_local":
-            label = ex['label']
-            correct_sol = ex['sol1'] if label == 0 else ex['sol2']
-            text = f"Goal: {ex['goal']}\nSolution: {correct_sol}"
-        elif data_source_type == "network" and dataset_name == "hellaswag":
-            correct_ending = ex['endings'][int(ex['label'])]
-            text = f"Context: {ex['ctx']}\nEnding: {correct_ending}"
-        else:
-            content = ex.get('text', "")
-            text = content if len(content) > 10 else "Padding text."
-        return tokenizer(text, truncation=True, max_length=128, padding="max_length")
+        if data_source_type == "piqa_local": return tokenizer(f"Goal: {ex['goal']}\nSolution: {ex['sol1'] if ex['label']==0 else ex['sol2']}", truncation=True, max_length=128, padding="max_length")
+        elif data_source_type == "network" and dataset_name == "hellaswag": return tokenizer(f"Context: {ex['ctx']}\nEnding: {ex['endings'][int(ex['label'])]}", truncation=True, max_length=128, padding="max_length")
+        else: return tokenizer(ex.get('text', "Pad"), truncation=True, max_length=128, padding="max_length")
+    return ds.map(format_fn, remove_columns=ds.column_names)
 
-    tokenized_ds = ds.map(format_fn, remove_columns=ds.column_names)
-    return tokenized_ds
+def train_global_harmonizers(full_model, tokenizer, accelerator, num_steps=200):
+    logger.info("⚡ [Server] Pre-training Global Harmonizer Pool...")
+    
+    if hasattr(full_model, "model") and hasattr(full_model.model, "layers"):
+        original_layers = full_model.model.layers
+    elif hasattr(full_model, "layers"):
+        original_layers = full_model.layers
+    else:
+        raise ValueError("Unsupported architecture")
+        
+    num_layers = len(original_layers)
+    ref_type = getattr(original_layers[0], "attention_type", "full")
+    
+    global_harmonizers = nn.ModuleList([Harmonizer(full_model.config, 128, ref_type) for _ in range(num_layers)])
+    global_harmonizers.to(accelerator.device); global_harmonizers.train()
+    optimizer = torch.optim.AdamW(global_harmonizers.parameters(), lr=1e-3)
+    loss_fct = nn.KLDivLoss(reduction="batchmean")
 
-# ==========================================
-# Core Logic
-# ==========================================
-def create_emulator(full_model, budget=4):
+    raw_ds = [{"text": "The quick brown fox jumps over the lazy dog. " * 20} for _ in range(400)]
+    def tok(ex): return tokenizer(ex["text"], truncation=True, max_length=128, padding="max_length")
+    tokenized_ds = [tok(x) for x in raw_ds]
+    align_loader = DataLoader(
+        list(zip([torch.tensor(t['input_ids']) for t in tokenized_ds], [torch.tensor(t['attention_mask']) for t in tokenized_ds])), 
+        batch_size=4, shuffle=True
+    )
+
+    full_model.to(accelerator.device)
+    iterator = iter(align_loader)
+    
+    for param in full_model.parameters():
+        param.requires_grad = False
+    
+    for step in range(num_steps):
+        try: batch_raw = next(iterator)
+        except: iterator = iter(align_loader); batch_raw = next(iterator)
+        
+        input_ids = batch_raw[0].to(accelerator.device)
+        attention_mask = batch_raw[1].to(accelerator.device)
+
+        with torch.no_grad():
+            full_model.eval()
+            teacher_logits = full_model(input_ids=input_ids, attention_mask=attention_mask).logits
+
+        mask = torch.rand(num_layers) > 0.5
+        mask[0] = True; mask[-1] = True
+        
+        mixed_layers = nn.ModuleList()
+        for idx in range(num_layers):
+            if mask[idx]: mixed_layers.append(original_layers[idx])
+            else: mixed_layers.append(global_harmonizers[idx])
+            
+        if hasattr(full_model, "model") and hasattr(full_model.model, "layers"):
+            full_model.model.layers = mixed_layers
+        else: full_model.layers = mixed_layers
+            
+        full_model.train()
+        student_logits = full_model(input_ids=input_ids, attention_mask=attention_mask).logits
+        
+        if hasattr(full_model, "model") and hasattr(full_model.model, "layers"):
+            full_model.model.layers = original_layers
+        else: full_model.layers = original_layers
+
+        loss = loss_fct(torch.nn.functional.log_softmax(student_logits, dim=-1), torch.nn.functional.softmax(teacher_logits, dim=-1))
+        loss.backward(); optimizer.step(); optimizer.zero_grad()
+        if step % 50 == 0: logger.info(f"   Pool Align Step {step} | Loss: {loss.item():.4f}")
+
+    global_harmonizers.cpu()
+    logger.info("✅ Global Harmonizer Pool Ready.")
+    return global_harmonizers
+
+def create_emulator(full_model, global_harmonizers, budget=6):
     emulator = copy.deepcopy(full_model)
     layers = get_module_layers(emulator)
     total = len(layers)
-    if budget >= total: return emulator
+    
     indices = {0, total-1}
     rem = budget - 2
     if rem > 0:
         if rem == 1: indices.add(total//2)
         else: indices.update(np.linspace(1, total-2, rem, dtype=int))
-    adapter_indices = sorted(list(indices))
-    new_layers = []
-    curr = 0
-    ref_type = getattr(layers[0], "attention_type", "full")
-    while curr < total:
+    adapter_indices = set(indices)
+    
+    new_layers = []; layer_map = {}
+    for curr in range(total):
         if curr in adapter_indices:
             l = layers[curr]
             l.original_layer_idx = curr
             new_layers.append(l)
-            curr += 1
+            layer_map[curr] = curr
         else:
-            gap = 0
-            while (curr + gap < total) and (curr + gap not in adapter_indices): gap += 1
-            new_layers.append(Harmonizer(full_model.config, 128, ref_type))
-            curr += gap
+            h = copy.deepcopy(global_harmonizers[curr])
+            h.original_layer_idx = None
+            new_layers.append(h)
+            
     set_module_layers(emulator, nn.ModuleList(new_layers))
     emulator.config.use_cache = False
-    
-    layer_map = {}
-    for i, layer in enumerate(new_layers):
-        if hasattr(layer, "original_layer_idx") and layer.original_layer_idx is not None:
-            layer_map[i] = layer.original_layer_idx
     emulator.config.layer_map = layer_map
     
     for param in emulator.parameters(): param.requires_grad = False
@@ -192,37 +193,6 @@ def create_emulator(full_model, budget=4):
         else: param.requires_grad = False
     return emulator
 
-def server_side_alignment(full_model, emulator, tokenizer, accelerator, num_steps=100):
-    logger.info("⚡ Baseline Alignment (Synthetic/Wiki)...")
-    # Synthetic warm up
-    raw_ds = [{"text": "The quick brown fox jumps over the lazy dog. " * 20} for _ in range(200)]
-    def tok(ex): return tokenizer(ex["text"], truncation=True, max_length=128, padding="max_length")
-    tokenized_ds = [tok(x) for x in raw_ds]
-    input_ids = torch.tensor([t['input_ids'] for t in tokenized_ds])
-    attention_mask = torch.tensor([t['attention_mask'] for t in tokenized_ds])
-    align_loader = DataLoader(list(zip(input_ids, attention_mask)), batch_size=4, shuffle=True, collate_fn=lambda x: {"input_ids": torch.stack([i[0] for i in x]), "attention_mask": torch.stack([i[1] for i in x])})
-
-    full_model.eval(); full_model.to(accelerator.device)
-    emulator.train(); emulator.to(accelerator.device)
-    params = [p for n, p in emulator.named_parameters() if "Harmonizer" in n]
-    if not params: return
-    optimizer = torch.optim.AdamW(params, lr=1e-3)
-    loss_fct = nn.KLDivLoss(reduction="batchmean")
-
-    iterator = iter(align_loader)
-    for step in range(num_steps):
-        try: batch = next(iterator)
-        except: iterator = iter(align_loader); batch = next(iterator)
-        batch = {k: v.to(accelerator.device) for k, v in batch.items()}
-        with torch.no_grad(): teacher_logits = full_model(**batch).logits
-        student_logits = emulator(**batch).logits
-        loss = loss_fct(torch.nn.functional.log_softmax(student_logits, dim=-1), torch.nn.functional.softmax(teacher_logits, dim=-1))
-        loss.backward(); optimizer.step(); optimizer.zero_grad()
-    
-    for name, param in emulator.named_parameters():
-        if "lora_" in name: param.requires_grad = True
-    torch.cuda.empty_cache()
-
 def evaluate_full_model_plugback(full_model, emulator_model, dataloader, accelerator, tokenizer):
     full_model.eval()
     emu_state = emulator_model.state_dict()
@@ -232,28 +202,18 @@ def evaluate_full_model_plugback(full_model, emulator_model, dataloader, acceler
     if hasattr(emulator_model, "config") and hasattr(emulator_model.config, "layer_map"):
         idx_map = emulator_model.config.layer_map
     elif hasattr(emulator_model, "base_model") and hasattr(emulator_model.base_model.model, "config"):
-        if hasattr(emulator_model.base_model.model.config, "layer_map"):
-            idx_map = emulator_model.base_model.model.config.layer_map
+        idx_map = emulator_model.base_model.model.config.layer_map
             
-    mapped_count = 0
     for k, v in emu_state.items():
         if "lora_" in k:
             parts = k.split('.')
             try:
                 if 'layers' in parts:
-                    layer_kw_idx = parts.index('layers')
-                    emu_layer_idx = int(parts[layer_kw_idx + 1])
+                    emu_layer_idx = int(parts[parts.index('layers') + 1])
                     if emu_layer_idx in idx_map:
-                        real_idx = idx_map[emu_layer_idx]
-                        parts[layer_kw_idx + 1] = str(real_idx)
-                        new_key = ".".join(parts)
-                        adapter_lora_state[new_key] = v.cpu()
-                        mapped_count += 1
+                        parts[parts.index('layers') + 1] = str(idx_map[emu_layer_idx])
+                        adapter_lora_state[".".join(parts)] = v.cpu()
             except: continue
-            
-    if not hasattr(evaluate_full_model_plugback, "debug_printed"):
-        print(f"🔥 Baseline Plug-back: Mapped {mapped_count} keys.")
-        evaluate_full_model_plugback.debug_printed = True
 
     temp_full = copy.deepcopy(full_model)
     peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, r=8, lora_alpha=32, target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
@@ -265,8 +225,7 @@ def evaluate_full_model_plugback(full_model, emulator_model, dataloader, acceler
     with torch.no_grad():
         for i, batch in enumerate(dataloader):
             if i >= 10: break
-            batch = {k: v.to(accelerator.device) for k, v in batch.items()}
-            batch.pop("labels", None); batch.pop("label", None)
+            batch = {k: v.to(accelerator.device) for k, v in batch.items() if k in ['input_ids', 'attention_mask']}
             labels = batch["input_ids"].clone(); labels[labels==tokenizer.pad_token_id] = -100
             outputs = peft_full(**batch, labels=labels)
             total_loss += outputs.loss.item(); steps += 1
@@ -275,8 +234,8 @@ def evaluate_full_model_plugback(full_model, emulator_model, dataloader, acceler
     return total_loss / steps if steps > 0 else 0.0
 
 class VirtualClient:
-    def __init__(self, client_id, train_loader, test_loader, label_dist_str):
-        self.id = client_id; self.train_dataloader = train_loader; self.test_dataloader = test_loader; self.label_info = label_dist_str
+    def __init__(self, client_id, train_loader, test_loader):
+        self.id = client_id; self.train_dataloader = train_loader; self.test_dataloader = test_loader
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -285,9 +244,9 @@ def parse_args():
     parser.add_argument("--num_clients", type=int, default=10)
     parser.add_argument("--num_clusters", type=int, default=2)
     parser.add_argument("--alpha", type=float, default=0.1)
-    parser.add_argument("--layer_budget", type=int, default=4)
+    parser.add_argument("--layer_budget", type=int, default=6)
     parser.add_argument("--rounds", type=int, default=20)
-    parser.add_argument("--local_steps", type=int, default=5)
+    parser.add_argument("--local_steps", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
@@ -305,66 +264,37 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True, trust_remote_code=True)
     if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
-    config = AutoConfig.from_pretrained(args.model_name, trust_remote_code=True)
-    full_model = AutoModelForCausalLM.from_pretrained(args.model_name, config=config, trust_remote_code=True)
-    base_emulator = create_emulator(full_model, budget=args.layer_budget)
+    full_model = AutoModelForCausalLM.from_pretrained(args.model_name, trust_remote_code=True)
     full_model.cpu() 
     
     clients = []
-    half_clients = args.num_clients // 2
     ds_a = load_benchmark_data("piqa", tokenizer, cache_dir=args.cache_dir, num_samples=2000)
-    ds_b = load_benchmark_data("hellaswag", tokenizer, cache_dir=args.cache_dir, num_samples=2000)
-    
-    for i in range(half_clients):
-        sub = ds_a.select(np.array_split(range(len(ds_a)), half_clients)[i])
+    for i in range(args.num_clients):
+        sub = ds_a.select(np.array_split(range(len(ds_a)), args.num_clients)[i])
         split = sub.train_test_split(test_size=0.1)
-        clients.append(VirtualClient(i, DataLoader(split['train'], batch_size=4, collate_fn=default_data_collator, shuffle=True), DataLoader(split['test'], batch_size=4, collate_fn=default_data_collator), "PIQA"))
-    for i in range(args.num_clients - half_clients):
-        cid = half_clients + i
-        sub = ds_b.select(np.array_split(range(len(ds_b)), args.num_clients - half_clients)[i])
-        split = sub.train_test_split(test_size=0.1)
-        clients.append(VirtualClient(cid, DataLoader(split['train'], batch_size=4, collate_fn=default_data_collator, shuffle=True), DataLoader(split['test'], batch_size=4, collate_fn=default_data_collator), "HellaSwag"))
+        clients.append(VirtualClient(i, DataLoader(split['train'], batch_size=4, collate_fn=default_data_collator, shuffle=True), DataLoader(split['test'], batch_size=4, collate_fn=default_data_collator)))
 
-    sensitivity_vectors = []
-    full_model.to(accelerator.device); full_model.train()
-    init_state = {k: v.clone().cpu() for k, v in full_model.state_dict().items()}
-    for client in clients:
-        full_model.load_state_dict(init_state); full_model.zero_grad()
-        avg_grad = np.zeros(len(get_module_layers(full_model)))
-        valid = 0; iter_loader = iter(client.train_dataloader)
-        for _ in range(3):
-            try: batch = next(iter_loader); batch = {k: v.to(accelerator.device) for k, v in batch.items()}; batch.pop("labels",None); batch.pop("label",None)
-            except: break
-            full_model(**batch, labels=batch["input_ids"]).loss.backward()
-            avg_grad += compute_layer_sensitivity(full_model, accelerator)
-            valid += 1; full_model.zero_grad()
-        if valid>0: avg_grad/=valid
-        sensitivity_vectors.append(avg_grad)
-    full_model.cpu()
-    if len(sensitivity_vectors)>0: labels = KMeans(n_clusters=min(args.num_clusters,len(sensitivity_vectors)), random_state=42).fit_predict(np.stack(sensitivity_vectors))
-    else: labels = []
-    clusters = {i: [] for i in range(args.num_clusters)}
-    for i, l in enumerate(labels): clusters[l].append(clients[i])
+    # Dummy clustering for baseline to match structure
+    clusters = {i: clients[i*(args.num_clients//args.num_clusters):(i+1)*(args.num_clients//args.num_clusters)] for i in range(args.num_clusters)}
 
-    logger.info("=== [Step 3] Baseline Training (LoRA + Harmonizer + Alignment) ===")
-    trainable_keys = get_trainable_keys(base_emulator)
-    init_emu_state = {k: v.clone().detach().cpu() for k, v in base_emulator.state_dict().items() if k in trainable_keys}
-    cluster_global_states = {k: copy.deepcopy(init_emu_state) for k in range(args.num_clusters)}
-    
+    logger.info("=== [Step 3] Baseline Training Global Harmonizers ===")
+    global_harmonizers = train_global_harmonizers(full_model, tokenizer, accelerator, num_steps=200)
+
+    cluster_global_states = {}
     for cid in range(args.num_clusters):
-        emu = create_emulator(full_model, args.layer_budget)
-        server_side_alignment(full_model, emu, tokenizer, accelerator, num_steps=100)
+        emu = create_emulator(full_model, global_harmonizers, args.layer_budget)
         trainable_keys = get_trainable_keys(emu)
         cluster_global_states[cid] = {k: v.clone().cpu() for k, v in emu.state_dict().items() if k in trainable_keys}
         del emu
 
+    logger.info("=== [Step 5] Federated Training ===")
     for round_idx in range(args.rounds):
         logger.info(f"--- Round {round_idx + 1} ---")
         round_metrics = {}
         for cid, c_clients in clusters.items():
             if not c_clients: continue
             
-            training_model = create_emulator(full_model, budget=args.layer_budget)
+            training_model = create_emulator(full_model, global_harmonizers, args.layer_budget)
             training_model.load_state_dict(cluster_global_states[cid], strict=False)
             training_model.to(accelerator.device); training_model.train()
             
@@ -377,39 +307,29 @@ def main():
                 training_model.load_state_dict(cluster_global_states[cid], strict=False)
                 for step, batch in enumerate(client.train_dataloader):
                     if step >= args.local_steps: break
-                    batch = {k: v.to(accelerator.device) for k, v in batch.items()}
-                    batch.pop("labels", None); batch.pop("label", None)
+                    batch = {k: v.to(accelerator.device) for k, v in batch.items() if k in ['input_ids', 'attention_mask']}
                     labels = batch["input_ids"].clone(); labels[labels==tokenizer.pad_token_id] = -100
-                    
-                    outputs = training_model(**batch, labels=labels)
-                    loss = outputs.loss
-                    loss.backward()
-                    optimizer.step(); optimizer.zero_grad()
+                    loss = training_model(**batch, labels=labels).loss
+                    loss.backward(); optimizer.step(); optimizer.zero_grad()
                     emu_loss += loss.item(); emu_steps += 1
                 
-                client_state = training_model.state_dict()
                 for key in current_cpu:
-                    delta = client_state[key].cpu() - current_cpu[key]
-                    global_update[key] = global_update.get(key, 0) + delta
+                    global_update[key] = global_update.get(key, 0) + (training_model.state_dict()[key].cpu() - current_cpu[key])
 
             if global_update:
-                for key in global_update:
-                    cluster_global_states[cid][key] += global_update[key] / len(c_clients)
+                for key in global_update: cluster_global_states[cid][key] += global_update[key] / len(c_clients)
             
             training_model.load_state_dict(cluster_global_states[cid], strict=False)
             plug_loss = evaluate_full_model_plugback(full_model, training_model, c_clients[0].test_dataloader, accelerator, tokenizer)
-            
             avg_emu = emu_loss / emu_steps if emu_steps > 0 else 0.0
             
-            # PPL
             try: emu_ppl = math.exp(avg_emu)
             except: emu_ppl = float('inf')
             try: plug_ppl = math.exp(plug_loss)
             except: plug_ppl = float('inf')
             
-            logger.info(f"Cluster {cid} | Emu: {avg_emu:.4f} (PPL: {emu_ppl:.2f}) | Plug: {plug_loss:.4f} (PPL: {plug_ppl:.2f})")
-            round_metrics[f"c{cid}_emu"] = avg_emu; round_metrics[f"c{cid}_plug"] = plug_loss
-            round_metrics[f"c{cid}_plug_ppl"] = plug_ppl
+            logger.info(f"Cluster {cid} | Emu PPL: {emu_ppl:.2f} | Plug PPL: {plug_ppl:.2f}")
+            round_metrics[f"c{cid}_emu"] = avg_emu; round_metrics[f"c{cid}_plug"] = plug_loss; round_metrics[f"c{cid}_plug_ppl"] = plug_ppl
             del training_model; del optimizer; torch.cuda.empty_cache()
 
         round_metrics["round"] = round_idx + 1
