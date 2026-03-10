@@ -152,10 +152,6 @@ def eval_mc_accuracy(model, test_dataset, task_type, accelerator, tokenizer, ful
 # [CORE] ScaleOT: RL + DL Dynamic LayerReplace
 # ==========================================
 def train_dynamic_layer_replace(full_model, tokenizer, accelerator, num_steps=200):
-    """
-    Paper Section 4.1: Importance Estimation via RL and DL.
-    Alternates between training Harmonizers (DL) and updating Importance Scores (RL).
-    """
     logger.info("⚡ [ScaleOT Server] Starting Dynamic LayerReplace (RL + DL)...")
     
     if hasattr(full_model, "model") and hasattr(full_model.model, "layers"): original_layers = full_model.model.layers
@@ -165,21 +161,16 @@ def train_dynamic_layer_replace(full_model, tokenizer, accelerator, num_steps=20
     num_layers = len(original_layers)
     ref_type = getattr(original_layers[0], "attention_type", "full")
     
-    # 1. Initialize Harmonizers (DL Component)
     harmonizers = nn.ModuleList([Harmonizer(full_model.config, 128, ref_type) for _ in range(num_layers)])
     harmonizers.to(accelerator.device); harmonizers.train()
     dl_optimizer = torch.optim.AdamW(harmonizers.parameters(), lr=1e-4)
     loss_fct = nn.CrossEntropyLoss()
     
-    # 2. Initialize Importance Scores (RL Component)
-    # Start at 0 -> sigmoid(0) = 0.5 probability
     importance_scores = torch.zeros(num_layers, device=accelerator.device, requires_grad=False)
 
-    # Dataloader (Public data simulation)
     raw_ds = [{"text": "The quick brown fox jumps over the lazy dog. " * 20} for _ in range(400)]
     def tok(ex): return tokenizer(ex["text"], truncation=True, max_length=128, padding="max_length")
     tokenized_ds = [tok(x) for x in raw_ds]
-    # Split into Train (for DL) and Val (for RL)
     train_dl = DataLoader([{"input_ids": torch.tensor(t['input_ids'])} for t in tokenized_ds[:300]], batch_size=4, shuffle=True)
     val_dl = DataLoader([{"input_ids": torch.tensor(t['input_ids'])} for t in tokenized_ds[300:]], batch_size=4, shuffle=True)
 
@@ -190,26 +181,20 @@ def train_dynamic_layer_replace(full_model, tokenizer, accelerator, num_steps=20
     for param in full_model.parameters(): param.requires_grad = False
     
     for step in range(num_steps):
-        # ----------------------------------------------------
-        # Phase 1: Deep Learning (Update Harmonizers)
-        # ----------------------------------------------------
         try: batch_t = next(train_iter)
         except: train_iter = iter(train_dl); batch_t = next(train_iter)
         input_ids = batch_t["input_ids"].to(accelerator.device)
 
-        # Action Policy: \pi_i = U(0, sigmoid(s_i))
         current_probs = torch.sigmoid(importance_scores)
         rand_u = torch.rand(num_layers, device=accelerator.device)
         sampled_probs = rand_u * current_probs
         
-        # Grouping constraint Ng=4
         mask_dl = torch.zeros(num_layers, dtype=torch.bool, device=accelerator.device)
         for i in range(0, num_layers, 4):
             group_p = sampled_probs[i:i+4]
             if len(group_p) > 0: mask_dl[i:i+4] = group_p >= torch.median(group_p)
-        mask_dl[0] = True; mask_dl[-1] = True # Keep ends
+        mask_dl[0] = True; mask_dl[-1] = True 
         
-        # Black-box swap
         mixed_layers = nn.ModuleList([original_layers[idx] if mask_dl[idx] else harmonizers[idx] for idx in range(num_layers)])
         if hasattr(full_model, "model") and hasattr(full_model.model, "layers"): full_model.model.layers = mixed_layers
         else: full_model.layers = mixed_layers
@@ -219,12 +204,8 @@ def train_dynamic_layer_replace(full_model, tokenizer, accelerator, num_steps=20
         shift_logits = outputs.logits[..., :-1, :].contiguous()
         shift_labels = input_ids[..., 1:].contiguous()
         loss_dl_val = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        
         loss_dl_val.backward(); dl_optimizer.step(); dl_optimizer.zero_grad()
 
-        # ----------------------------------------------------
-        # Phase 2: Reinforcement Learning (Update Scores)
-        # ----------------------------------------------------
         try: batch_v = next(val_iter)
         except: val_iter = iter(val_dl); batch_v = next(val_iter)
         val_input_ids = batch_v["input_ids"].to(accelerator.device)
@@ -232,12 +213,11 @@ def train_dynamic_layer_replace(full_model, tokenizer, accelerator, num_steps=20
         full_model.eval()
         losses_v = []
         masks_v = []
-        Nc = 3 # Sample Nc candidates
+        Nc = 3 
         with torch.no_grad():
             for _ in range(Nc):
                 rand_u_v = torch.rand(num_layers, device=accelerator.device)
                 sampled_probs_v = rand_u_v * current_probs
-                
                 mask_j = torch.zeros(num_layers, dtype=torch.bool, device=accelerator.device)
                 for i in range(0, num_layers, 4):
                     group_p = sampled_probs_v[i:i+4]
@@ -252,23 +232,18 @@ def train_dynamic_layer_replace(full_model, tokenizer, accelerator, num_steps=20
                 shift_logits_v = out_v.logits[..., :-1, :].contiguous()
                 shift_labels_v = val_input_ids[..., 1:].contiguous()
                 loss_j = loss_fct(shift_logits_v.view(-1, shift_logits_v.size(-1)), shift_labels_v.view(-1)).item()
-                
                 losses_v.append(loss_j)
                 masks_v.append(mask_j)
                 
-        # Calculate Reward and update
         exp_losses = [math.exp(-l) for l in losses_v]
         baseline = sum(exp_losses) / Nc
         
         for j in range(Nc):
             r_j = exp_losses[j] - baseline
-            # Eq 5: s_i = s_i + r_j * sig * (1-sig)
             for i in range(num_layers):
                 if masks_v[j][i]:
-                    # learning rate for RL set to 0.1 for stability
                     importance_scores[i] += 0.1 * r_j * current_probs[i] * (1 - current_probs[i])
         
-        # Restore architecture
         if hasattr(full_model, "model") and hasattr(full_model.model, "layers"): full_model.model.layers = original_layers
         else: full_model.layers = original_layers
         
@@ -279,63 +254,72 @@ def train_dynamic_layer_replace(full_model, tokenizer, accelerator, num_steps=20
     return importance_scores.cpu().numpy(), harmonizers
 
 # ==========================================
-# [CORE] ScaleOT Emulator Creation with SRC
+# [CORE] ScaleOT Emulator Creation (Strict Block-wise + SRC)
 # ==========================================
-def create_scaleot_emulator(full_model, importance_scores, harmonizers, budget_adapter=6, alpha=0.25, beta=0.8):
-    """
-    Paper Section 4.3: Emulator Creation.
-    Combines Adapters, Harmonizers, and SRC-compressed layers.
-    """
+# 增加了一个 verbose 参数，默认为 False
+def create_scaleot_emulator(full_model, importance_scores, harmonizers, budget_adapter=6, alpha=0.25, beta=0.8, verbose=False):
     emulator = copy.deepcopy(full_model)
     layers = get_module_layers(emulator)
     num_layers = len(layers)
     
-    # 1. Identify Adapters (\Phi_A) - Top `budget_adapter` layers
-    ranked = sorted(range(num_layers), key=lambda i: importance_scores[i], reverse=True)
-    adapter_indices = set()
-    for idx in ranked:
-        if len(adapter_indices) >= budget_adapter: break
-        adapter_indices.add(idx)
-    adapter_indices.add(0); adapter_indices.add(num_layers-1) # Always keep ends
-        
-    # 2. Identify Harmonizers (\Phi_H) - Bottom \alpha ratio per group
+    adapter_indices = {0, num_layers - 1}
     harmonizer_indices = set()
-    for i in range(0, num_layers, 4):
-        group = list(range(i, min(i+4, num_layers)))
-        group_scores = [(g, importance_scores[g]) for g in group]
-        k = max(1, int(len(group) * alpha))
-        bottom_k = sorted(group_scores, key=lambda x: x[1])[:k]
-        for idx, _ in bottom_k:
-            if idx not in adapter_indices:
-                harmonizer_indices.add(idx)
+    src_indices = set()
+    
+    rem_adapters = budget_adapter - 2
+    middle_layers = list(range(1, num_layers - 1))
+    
+    if rem_adapters > 0:
+        chunks = np.array_split(middle_layers, rem_adapters)
+    else:
+        chunks = [middle_layers]
+        
+    for chunk in chunks:
+        if len(chunk) == 0: continue
+        
+        chunk_scores = [(idx, importance_scores[idx]) for idx in chunk]
+        chunk_scores.sort(key=lambda x: x[1], reverse=True)
+        
+        if rem_adapters > 0:
+            adapter_idx = chunk_scores[0][0]
+            adapter_indices.add(adapter_idx)
+            remaining_scores = chunk_scores[1:]
+        else:
+            remaining_scores = chunk_scores
+            
+        num_harmonizers = max(1, int(len(chunk) * alpha))
+        num_harmonizers = min(num_harmonizers, len(remaining_scores)) 
+        
+        for i in range(len(remaining_scores) - num_harmonizers, len(remaining_scores)):
+            harmonizer_indices.add(remaining_scores[i][0])
+            
+        for i in range(len(remaining_scores) - num_harmonizers):
+            src_indices.add(remaining_scores[i][0])
                 
-    logger.info(f"    - Adapters: {sorted(list(adapter_indices))}")
-    logger.info(f"    - Harmonizers: {sorted(list(harmonizer_indices))}")
+    # 仅在 verbose=True 时打印，避免日志刷屏
+    if verbose:
+        logger.info(f"    - Adapters (Block-wise Top): {sorted(list(adapter_indices))}")
+        logger.info(f"    - Harmonizers (Block-wise Bottom): {sorted(list(harmonizer_indices))}")
+        logger.info(f"    - SRC Layers (Middle): {sorted(list(src_indices))}")
                 
-    # 3. Assemble New Layers
     new_layers = []
     layer_map = {}
     
     for curr in range(num_layers):
         if curr in adapter_indices:
-            # Type A: Original full-rank adapter layer
             l = layers[curr]
             l.original_layer_idx = curr
             new_layers.append(l)
             layer_map[curr] = curr
             
         elif curr in harmonizer_indices:
-            # Type B: Harmonizer
             h = copy.deepcopy(harmonizers[curr])
             h.original_layer_idx = None
             new_layers.append(h)
             
         else:
-            # Type C: SRC Frozen Layer (\Phi_E)
             l = layers[curr]
             l.original_layer_idx = curr
-            
-            # Apply SVD-based Rank-r Approximation to MHSA (Paper Section 4.2)
             with torch.no_grad():
                 if hasattr(l, "self_attn"):
                     attn = l.self_attn
@@ -345,11 +329,10 @@ def create_scaleot_emulator(full_model, importance_scores, harmonizers, budget_a
                             W = linear.weight.data.float()
                             try:
                                 U, S, Vt = torch.linalg.svd(W, full_matrices=False)
-                                r = max(1, int(min(W.shape) * beta)) # Retain beta% rank
+                                r = max(1, int(min(W.shape) * beta)) 
                                 W_approx = U[:, :r] @ torch.diag(S[:r]) @ Vt[:r, :]
                                 linear.weight.data = W_approx.to(linear.weight.dtype)
-                            except Exception as e:
-                                pass # SVD might fail to converge on CPU sometimes
+                            except Exception: pass
             new_layers.append(l)
             layer_map[curr] = curr
             
@@ -357,19 +340,13 @@ def create_scaleot_emulator(full_model, importance_scores, harmonizers, budget_a
     emulator.config.use_cache = False
     emulator.config.layer_map = layer_map 
     
-    # 4. Inject LoRA ONLY to adapter and harmonizer parameters
     for param in emulator.parameters(): param.requires_grad = False
     peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, r=8, lora_alpha=32, target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
     emulator = get_peft_model(emulator, peft_config)
     if hasattr(emulator, "config"): emulator.config.layer_map = layer_map
     
-    # Freeze SRC layers, only train adapters & harmonizers
     for name, param in emulator.named_parameters():
         if "Harmonizer" in name or "lora_" in name: 
-            # Check if this layer is an adapter (exists in layer_map)
-            # If it's a LoRA on a SRC frozen layer, we should freeze it. But simple way:
-            # ScaleOT only puts adapters on \Phi_A. PEFT puts LoRA on everything. 
-            # We explicitly freeze LoRA weights if their original layer index is not in adapter_indices
             is_trainable = False
             if "Harmonizer" in name: is_trainable = True
             elif "lora_" in name:
@@ -426,8 +403,8 @@ def parse_args():
     parser.add_argument("--dataset_name", type=str, default="mixed_piqa_hellaswag")
     parser.add_argument("--num_clients", type=int, default=10)
     parser.add_argument("--num_clusters", type=int, default=2)
-    parser.add_argument("--alpha", type=float, default=0.25) # ScaleOT default
-    parser.add_argument("--beta", type=float, default=0.8)   # ScaleOT default SRC
+    parser.add_argument("--alpha", type=float, default=0.25) 
+    parser.add_argument("--beta", type=float, default=0.8)   
     parser.add_argument("--layer_budget", type=int, default=6)
     parser.add_argument("--rounds", type=int, default=20)
     parser.add_argument("--local_steps", type=int, default=10)
@@ -451,7 +428,6 @@ def main():
     full_model = AutoModelForCausalLM.from_pretrained(args.model_name, trust_remote_code=True)
     full_model.cpu() 
     
-    # 1. Load Data
     clients = []
     raw_ds_a, type_a = load_raw_benchmark_data("piqa", cache_dir=args.cache_dir, num_samples=2000)
     raw_ds_b, type_b = load_raw_benchmark_data("hellaswag", cache_dir=args.cache_dir, num_samples=2000)
@@ -473,12 +449,13 @@ def main():
 
     clusters = {i: clients[i*(args.num_clients//args.num_clusters):(i+1)*(args.num_clients//args.num_clusters)] for i in range(args.num_clusters)}
 
-    # 2. ScaleOT Pre-training (RL + DL) on Global Data
+    # 2. ScaleOT Pre-training (RL + DL)
     importance_scores, global_harmonizers = train_dynamic_layer_replace(full_model, tokenizer, accelerator, num_steps=200)
 
-    # 3. Create Global Emulator (ScaleOT uses a generic emulator for all clients)
-    logger.info("=== [Step 3] Assembling ScaleOT Emulator (with SRC) ===")
-    scaleot_emulator = create_scaleot_emulator(full_model, importance_scores, global_harmonizers, args.layer_budget, args.alpha, args.beta)
+    # 3. Create Global Emulator
+    logger.info("=== [Step 3] Assembling ScaleOT Emulator (Strict Block-wise + SRC) ===")
+    # 第一次初始化，verbose=True，打印选层结果
+    scaleot_emulator = create_scaleot_emulator(full_model, importance_scores, global_harmonizers, args.layer_budget, args.alpha, args.beta, verbose=True)
     trainable_keys = get_trainable_keys(scaleot_emulator)
     
     cluster_global_states = {}
@@ -494,8 +471,8 @@ def main():
             if not c_clients: continue
             task_type = c_clients[0].task_type
             
-            # Recreate emulator instance
-            training_model = create_scaleot_emulator(full_model, importance_scores, global_harmonizers, args.layer_budget, args.alpha, args.beta)
+            # 后续训练组装时，不再打印 (verbose=False)
+            training_model = create_scaleot_emulator(full_model, importance_scores, global_harmonizers, args.layer_budget, args.alpha, args.beta, verbose=False)
             training_model.load_state_dict(cluster_global_states[cid], strict=False)
             training_model.to(accelerator.device); training_model.train()
             
@@ -541,9 +518,6 @@ def main():
         round_metrics["round"] = round_idx + 1
         accelerator.log(round_metrics, step=round_idx + 1)
         
-    # =================================================================
-    # Final Full Evaluation
-    # =================================================================
     logger.info("==================================================")
     logger.info("🏆 Starting Final Full Evaluation...")
     final_metrics = {}
@@ -551,7 +525,8 @@ def main():
         if not c_clients: continue
         task_type = c_clients[0].task_type
         
-        final_model = create_scaleot_emulator(full_model, importance_scores, global_harmonizers, args.layer_budget, args.alpha, args.beta)
+        # 最终评估时也不需要打印 (verbose=False)
+        final_model = create_scaleot_emulator(full_model, importance_scores, global_harmonizers, args.layer_budget, args.alpha, args.beta, verbose=False)
         final_model.load_state_dict(cluster_global_states[cid], strict=False)
         final_model.to(accelerator.device)
         
