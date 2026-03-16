@@ -28,7 +28,7 @@ CACHE_DIR="/data/xiaowen"
 
 NUM_CLIENTS=10      
 NUM_CLUSTERS=2      
-LAYER_BUDGET=10
+LAYER_BUDGET=6
 ROUNDS=20           
 LOCAL_STEPS=10      
 LR="1e-4"           
