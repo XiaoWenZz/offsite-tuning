@@ -74,11 +74,9 @@ def compute_layer_sensitivity(model):
     layers = get_module_layers(model)
     sensitivity = np.zeros(len(layers))
     for i, layer in enumerate(layers):
-        # 使用 Taylor-1 (权重绝对值 * 梯度绝对值) 替代纯梯度
-        score = sum((p.data * p.grad.detach()).abs().sum().item() 
-                    for p in layer.parameters() if p.grad is not None)
-        sensitivity[i] = score
-    # 归一化防溢出
+        # 删掉 Taylor-1，恢复最稳健的 L2 范数！
+        sensitivity[i] = sum(p.grad.detach().float().norm(2).item() 
+                             for p in layer.parameters() if p.grad is not None)
     return sensitivity / (np.linalg.norm(sensitivity) + 1e-8)
 
 def get_trainable_keys(model):
@@ -179,7 +177,7 @@ def eval_mc_accuracy(model, test_dataset, task_type, accelerator, tokenizer, ful
 # ==========================================
 # Global Pool & Emulator Builders
 # ==========================================
-def train_global_harmonizers(full_model, tokenizer, accelerator, cache_dir=None, num_steps=200):
+def train_global_harmonizers(full_model, tokenizer, accelerator, cache_dir=None, num_steps=800):
     logger.info("⚡ [Server] Pre-training Global Harmonizer Pool on WikiText (Stochastic Swap)...")
     if hasattr(full_model, "model") and hasattr(full_model.model, "layers"): original_layers = full_model.model.layers
     elif hasattr(full_model, "layers"): original_layers = full_model.layers
@@ -419,7 +417,7 @@ def main():
     clusters = {i: [clients[j] for j, l in enumerate(labels) if l == i] for i in range(args.num_clusters)}
 
     # 3. Pre-train Global Harmonizers
-    global_harmonizers = train_global_harmonizers(full_model, tokenizer, accelerator, cache_dir=args.cache_dir, num_steps=200)
+    global_harmonizers = train_global_harmonizers(full_model, tokenizer, accelerator, cache_dir=args.cache_dir, num_steps=800)
 
     # 4. Initialize Emulators
     logger.info("=== [Step 4] Assembling Task-Aware Custom Emulators ===")

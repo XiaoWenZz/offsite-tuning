@@ -160,7 +160,7 @@ def eval_mc_accuracy(model, test_dataset, task_type, accelerator, tokenizer, ful
 # ==========================================
 # [CORE] ScaleOT: RL + DL Dynamic LayerReplace
 # ==========================================
-def train_dynamic_layer_replace(full_model, tokenizer, accelerator, cache_dir=None, num_steps=800):
+def train_dynamic_layer_replace(full_model, tokenizer, accelerator, cache_dir=None, num_steps=1000):
     logger.info("⚡ [ScaleOT Server] Starting Dynamic LayerReplace (RL + DL) on WikiText...")
     
     if hasattr(full_model, "model") and hasattr(full_model.model, "layers"): original_layers = full_model.model.layers
@@ -177,9 +177,6 @@ def train_dynamic_layer_replace(full_model, tokenizer, accelerator, cache_dir=No
     
     importance_scores = torch.zeros(num_layers, device=accelerator.device, requires_grad=False)
 
-    # ==========================================
-    # 📚 加载真正的 WikiText-2 作为 RL 搜索数据集
-    # ==========================================
     try:
         wiki_ds = datasets.load_dataset("wikitext", "wikitext-2-raw-v1", split="train", cache_dir=cache_dir)
         wiki_ds = wiki_ds.filter(lambda x: len(x["text"].strip()) > 20)
@@ -192,7 +189,6 @@ def train_dynamic_layer_replace(full_model, tokenizer, accelerator, cache_dir=No
     def tok(ex): return tokenizer(ex["text"], truncation=True, max_length=128, padding="max_length")
     tokenized_ds = [tok(x) for x in raw_ds]
     
-    # 按照 3:1 拆分训练和验证集 (DL需要Train，RL奖励计算需要Val)
     split_idx = int(len(tokenized_ds) * 0.75)
     train_dl = DataLoader([{"input_ids": torch.tensor(t['input_ids'])} for t in tokenized_ds[:split_idx]], batch_size=4, shuffle=True)
     val_dl = DataLoader([{"input_ids": torch.tensor(t['input_ids'])} for t in tokenized_ds[split_idx:]], batch_size=4, shuffle=True)
@@ -284,34 +280,27 @@ def create_scaleot_emulator_no_src(full_model, importance_scores, harmonizers, b
     layers = get_module_layers(emulator)
     num_layers = len(layers)
     
-    adapter_indices = {0, num_layers - 1}
     harmonizer_indices = set()
     
-    rem_adapters = budget_adapter - 2
-    middle_layers = list(range(1, num_layers - 1))
+    # 🔥 三明治约束：强制锁定 0, 1 层和 倒数两层
+    adapter_indices = {0, 1, num_layers - 2, num_layers - 1} 
+    rem_adapters = budget_adapter - 4
     
     if rem_adapters > 0:
+        middle_layers = list(range(2, num_layers - 2))
         chunks = np.array_split(middle_layers, rem_adapters)
-    else:
-        chunks = [middle_layers]
-        
-    for chunk in chunks:
-        if len(chunk) == 0: continue
-        
-        chunk_scores = [(idx, importance_scores[idx]) for idx in chunk]
-        chunk_scores.sort(key=lambda x: x[1], reverse=True)
-        
-        if rem_adapters > 0:
-            adapter_idx = chunk_scores[0][0]
-            adapter_indices.add(adapter_idx)
-            for i in range(1, len(chunk_scores)):
-                harmonizer_indices.add(chunk_scores[i][0])
-        else:
-            for i in range(len(chunk_scores)):
-                harmonizer_indices.add(chunk_scores[i][0])
+        for chunk in chunks:
+            if len(chunk) == 0: continue
+            chunk_scores = [(idx, importance_scores[idx]) for idx in chunk]
+            chunk_scores.sort(key=lambda x: x[1], reverse=True)
+            adapter_indices.add(int(chunk_scores[0][0]))
+            
+    for i in range(num_layers):
+        if i not in adapter_indices:
+            harmonizer_indices.add(i)
                 
     if verbose:
-        logger.info(f"    - Adapters (RL Block-wise Top): {sorted(list(adapter_indices))}")
+        logger.info(f"    - Adapters (RL Sandwich Block-wise): {sorted(list(adapter_indices))}")
         logger.info(f"    - Harmonizers (All Others): {sorted(list(harmonizer_indices))}")
                 
     new_layers = []
@@ -333,7 +322,8 @@ def create_scaleot_emulator_no_src(full_model, importance_scores, harmonizers, b
     emulator.config.layer_map = layer_map 
     
     for param in emulator.parameters(): param.requires_grad = False
-    peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, r=8, lora_alpha=32, target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
+    # 🔥 全量 LoRA
+    peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, r=8, lora_alpha=16, target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
     emulator = get_peft_model(emulator, peft_config)
     if hasattr(emulator, "config"): emulator.config.layer_map = layer_map
     
@@ -366,7 +356,7 @@ def evaluate_full_model_plugback(full_model, emulator_model, test_dataset, task_
             except: continue
 
     temp_full = copy.deepcopy(full_model)
-    peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, r=8, lora_alpha=32, target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
+    peft_config = LoraConfig(task_type=TaskType.CAUSAL_LM, r=8, lora_alpha=16, target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
     peft_full = get_peft_model(temp_full, peft_config)
     peft_full.load_state_dict(adapter_lora_state, strict=False)
     peft_full.to(accelerator.device)
@@ -383,10 +373,9 @@ class VirtualClient:
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-0.5B")
-    parser.add_argument("--dataset_name", type=str, default="mixed_piqa_hellaswag_sciq")
     parser.add_argument("--num_clients", type=int, default=12)
     parser.add_argument("--num_clusters", type=int, default=3)
-    parser.add_argument("--layer_budget", type=int, default=6)
+    parser.add_argument("--layer_budget", type=int, default=10)
     parser.add_argument("--rounds", type=int, default=20)
     parser.add_argument("--local_steps", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -421,39 +410,29 @@ def main():
     global_test_sciq = raw_ds_c.train_test_split(test_size=0.1)['test']
     
     for i in range(clients_per_task):
-        cid = i
         sub = raw_ds_a.select(np.array_split(range(len(raw_ds_a)), clients_per_task)[i])
         train_mapped = sub.map(lambda x: format_for_training(x, type_a, "piqa", tokenizer), remove_columns=sub.column_names)
-        clients.append(VirtualClient(cid, DataLoader(train_mapped, batch_size=4, collate_fn=default_data_collator, shuffle=True), global_test_piqa, "piqa"))
+        clients.append(VirtualClient(i, DataLoader(train_mapped, batch_size=4, collate_fn=default_data_collator, shuffle=True), global_test_piqa, "piqa"))
 
     for i in range(clients_per_task):
-        cid = i + clients_per_task
         sub = raw_ds_b.select(np.array_split(range(len(raw_ds_b)), clients_per_task)[i])
         train_mapped = sub.map(lambda x: format_for_training(x, type_b, "hellaswag", tokenizer), remove_columns=sub.column_names)
-        clients.append(VirtualClient(cid, DataLoader(train_mapped, batch_size=4, collate_fn=default_data_collator, shuffle=True), global_test_hellaswag, "hellaswag"))
+        clients.append(VirtualClient(i + clients_per_task, DataLoader(train_mapped, batch_size=4, collate_fn=default_data_collator, shuffle=True), global_test_hellaswag, "hellaswag"))
 
     for i in range(clients_per_task):
-        cid = i + 2 * clients_per_task
         sub = raw_ds_c.select(np.array_split(range(len(raw_ds_c)), clients_per_task)[i])
         train_mapped = sub.map(lambda x: format_for_training(x, type_c, "sciq", tokenizer), remove_columns=sub.column_names)
-        clients.append(VirtualClient(cid, DataLoader(train_mapped, batch_size=4, collate_fn=default_data_collator, shuffle=True), global_test_sciq, "sciq"))
+        clients.append(VirtualClient(i + 2 * clients_per_task, DataLoader(train_mapped, batch_size=4, collate_fn=default_data_collator, shuffle=True), global_test_sciq, "sciq"))
 
     clusters = {i: clients[i*(args.num_clients//args.num_clusters):(i+1)*(args.num_clients//args.num_clusters)] for i in range(args.num_clusters)}
 
-    # =================================================================
-    # [探针开始：ScaleOT RL搜索开销]
-    # =================================================================
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats(accelerator.device)
     start_time = time.time()
 
-    # 2. ScaleOT Pre-training (RL + DL)
     full_model.to(accelerator.device)
-    importance_scores, global_harmonizers = train_dynamic_layer_replace(full_model, tokenizer, accelerator, cache_dir=args.cache_dir, num_steps=200)
+    importance_scores, global_harmonizers = train_dynamic_layer_replace(full_model, tokenizer, accelerator, cache_dir=args.cache_dir, num_steps=1000)
 
-    # =================================================================
-    # [探针结束：ScaleOT RL搜索开销]
-    # =================================================================
     torch.cuda.synchronize()
     end_time = time.time()
     peak_vram_gb = torch.cuda.max_memory_allocated(accelerator.device) / (1024 ** 3)
@@ -466,8 +445,10 @@ def main():
     
     accelerator.log({"search_time_seconds": search_time, "search_peak_vram_gb": peak_vram_gb}, step=0)
 
-    # 3. Create Global Emulator (NO SRC, 100% Harmonizer for non-adapters)
-    logger.info("=== [Step 3] Assembling ScaleOT Emulator (RL Block-wise + NO SRC) ===")
+    full_model.cpu()
+    global_harmonizers.cpu()
+
+    logger.info("=== [Step 3] Assembling ScaleOT Emulator (RL Sandwich Block-wise + NO SRC) ===")
     scaleot_emulator = create_scaleot_emulator_no_src(full_model, importance_scores, global_harmonizers, args.layer_budget, verbose=True)
     trainable_keys = get_trainable_keys(scaleot_emulator)
     
@@ -475,7 +456,6 @@ def main():
     for cid in range(args.num_clusters):
         cluster_global_states[cid] = {k: v.clone().cpu() for k, v in scaleot_emulator.state_dict().items() if k in trainable_keys}
 
-    # 4. FL Loop
     logger.info("=== [Step 4] Federated Training ===")
     for round_idx in range(args.rounds):
         logger.info(f"--- Round {round_idx + 1} ---")
@@ -491,7 +471,7 @@ def main():
             
             optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, training_model.parameters()), lr=args.lr)
             global_update = {}
-            current_cpu = {k: v.clone().cpu() for k, v in training_model.state_dict().items() if k in cluster_global_states[cid]}
+            current_cpu = {k: v.detach().clone().cpu() for k, v in training_model.state_dict().items() if k in cluster_global_states[cid]}
             
             train_loss_sum = 0; train_steps = 0
             
@@ -506,7 +486,7 @@ def main():
                     train_loss_sum += loss.item(); train_steps += 1
                 
                 for key in current_cpu:
-                    global_update[key] = global_update.get(key, 0) + (training_model.state_dict()[key].cpu() - current_cpu[key])
+                    global_update[key] = global_update.get(key, 0) + (training_model.state_dict()[key].detach().cpu() - current_cpu[key])
 
             if global_update:
                 for key in global_update: cluster_global_states[cid][key] += global_update[key] / len(c_clients)

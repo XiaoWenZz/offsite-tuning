@@ -28,7 +28,7 @@ CACHE_DIR="/data/xiaowen"
 
 NUM_CLIENTS=12      # 修改为12，均分给3个任务
 NUM_CLUSTERS=3      # 修改为3个聚类
-LAYER_BUDGET=6      # 极限施压
+LAYER_BUDGET=10      
 ROUNDS=20           
 LOCAL_STEPS=10      
 LR="1e-4"           
@@ -36,7 +36,7 @@ LR="1e-4"
 ALPHA=0.25  
 BETA=0.8    
 
-export WANDB_PROJECT="fedrole_vs_scaleot_extreme"
+export WANDB_PROJECT="fedrole_vs_scaleot_v3"
 
 cd ../..
 echo "=================================================="
@@ -53,20 +53,20 @@ EXP_NAME_SCALEOT="ScaleOT_B${LAYER_BUDGET}_C${NUM_CLUSTERS}"
 echo ">>> [1/2] Running Baseline: ScaleOT (RL + DL without SRC)"
 export WANDB_NAME="$EXP_NAME_SCALEOT"
 
-# python $SCALEOT_SCRIPT \
-#     --model_name $MODEL \
-#     --dataset_name $DATASET \
-#     --num_clients $NUM_CLIENTS \
-#     --num_clusters $NUM_CLUSTERS \
-#     --layer_budget $LAYER_BUDGET \
-#     --rounds $ROUNDS \
-#     --local_steps $LOCAL_STEPS \
-#     --lr $LR \
-#     --batch_size 4 \
-#     --seed 42 \
-#     --wandb_project $WANDB_PROJECT \
-#     --cache-dir $CACHE_DIR \
-#     --wandb_run_name $WANDB_NAME
+python $SCALEOT_SCRIPT \
+    --model_name $MODEL \
+    --dataset_name $DATASET \
+    --num_clients $NUM_CLIENTS \
+    --num_clusters $NUM_CLUSTERS \
+    --layer_budget $LAYER_BUDGET \
+    --rounds $ROUNDS \
+    --local_steps $LOCAL_STEPS \
+    --lr $LR \
+    --batch_size 4 \
+    --seed 42 \
+    --wandb_project $WANDB_PROJECT \
+    --cache-dir $CACHE_DIR \
+    --wandb_run_name $WANDB_NAME
 
 echo "--------------------------------------------------"
 
